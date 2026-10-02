@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VenueBook · 场地预约与活动报名</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 56rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.7; color: #1f2933; }
+  h1 { margin-bottom: .2rem; }
+  h2 { margin-top: 2.5rem; border-bottom: 1px solid #d9e2ec; padding-bottom: .3rem; }
+  a { color: #175b9c; }
+  .muted { color: #616e7c; }
+  form { background: #f8fafc; border: 1px solid #d9e2ec; border-radius: .6rem; padding: 1.2rem 1.4rem; }
+  .field { margin-bottom: 1rem; }
+  label { display: block; font-weight: 600; margin-bottom: .25rem; }
+  input, select { font: inherit; padding: .4rem .55rem; border: 1px solid #b7c2cd; border-radius: .35rem; background: #fff; }
+  input[type=text], input[type=number] { width: 14rem; max-width: 100%; }
+  .hint { font-weight: 400; color: #616e7c; font-size: .9rem; }
+  fieldset { border: 1px dashed #b7c2cd; border-radius: .5rem; margin: 0 0 1rem; padding: .8rem 1rem 1rem; }
+  legend { font-weight: 600; padding: 0 .4rem; }
+  .hour-row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-bottom: .5rem; }
+  .hour-row select, .hour-row input { width: auto; }
+  button { font: inherit; padding: .45rem 1.1rem; border-radius: .4rem; border: 1px solid #175b9c; background: #175b9c; color: #fff; cursor: pointer; }
+  button.secondary { background: #fff; color: #175b9c; }
+  button.danger { background: #fff; color: #b42318; border-color: #b42318; padding: .3rem .7rem; }
+  #form-error { margin-top: .9rem; color: #b42318; font-weight: 600; white-space: pre-wrap; display: none; }
+  .venue-card { border: 1px solid #d9e2ec; border-radius: .6rem; padding: 1rem 1.3rem; margin-bottom: 1rem; background: #fff; }
+  .venue-card h3 { margin: 0 0 .3rem; }
+  .venue-meta { color: #52606d; margin: .15rem 0; }
+  .hours { margin: .5rem 0 0; padding: 0; list-style: none; }
+  .hours li { display: inline-block; background: #eef4fa; border-radius: 999px; padding: .15rem .8rem; margin: 0 .4rem .4rem 0; font-size: .92rem; }
+  .empty { color: #616e7c; background: #f8fafc; border: 1px dashed #b7c2cd; border-radius: .6rem; padding: 1.2rem; text-align: center; }
+  .next-day { color: #b42318; font-size: .85em; }
+</style>
+<main>
+  <h1>VenueBook</h1>
+  <p class="muted">场地预约与活动报名。<a href="/api/venues">场地列表接口</a> · <a href="/health">服务状态</a></p>
+
+  <h2>新增场地</h2>
+  <form id="venue-form" novalidate>
+    <div class="field">
+      <label for="name">名称</label>
+      <input id="name" name="name" type="text" autocomplete="off" required>
+    </div>
+    <div class="field">
+      <label for="capacity">容量（人）</label>
+      <input id="capacity" name="capacity" type="number" min="1" step="1" required>
+    </div>
+    <div class="field">
+      <label for="timezone">所在时区</label>
+      <input id="timezone" name="timezone" type="text" list="tz-list" placeholder="Asia/Shanghai" autocomplete="off" required>
+      <datalist id="tz-list">
+        <option value="Asia/Shanghai">
+        <option value="Asia/Tokyo">
+        <option value="Asia/Singapore">
+        <option value="Asia/Hong_Kong">
+        <option value="Asia/Taipei">
+        <option value="Asia/Seoul">
+        <option value="Asia/Kolkata">
+        <option value="Asia/Dubai">
+        <option value="Asia/Bangkok">
+        <option value="Europe/London">
+        <option value="Europe/Paris">
+        <option value="Europe/Berlin">
+        <option value="Australia/Sydney">
+        <option value="America/New_York">
+        <option value="America/Chicago">
+        <option value="America/Los_Angeles">
+        <option value="UTC">
+      </datalist>
+      <div class="hint">有效的 IANA 时区名称，例如 Asia/Shanghai；开放时间按此时区解释。</div>
+    </div>
+    <fieldset>
+      <legend>每周开放时间（可为空）</legend>
+      <div id="hours-rows"></div>
+      <button type="button" id="add-hour" class="secondary">添加开放时段</button>
+    </fieldset>
+    <button type="submit">保存</button>
+    <div id="form-error" role="alert"></div>
+  </form>
+
+  <h2>场地列表</h2>
+  <div id="venue-list">
+    <div class="empty">正在加载…</div>
+  </div>
+</main>
+
+<script>
+(function () {
+  var WEEKDAYS = { 1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六", 7: "周日" };
+
+  var form = document.getElementById("venue-form");
+  var hoursRows = document.getElementById("hours-rows");
+  var errorBox = document.getElementById("form-error");
+  var listBox = document.getElementById("venue-list");
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.style.display = "block";
+  }
+  function clearError() {
+    errorBox.textContent = "";
+    errorBox.style.display = "none";
+  }
+
+  function addHourRow() {
+    var row = document.createElement("div");
+    row.className = "hour-row";
+    var weekday = document.createElement("select");
+    weekday.className = "hour-weekday";
+    Object.keys(WEEKDAYS).forEach(function (d) {
+      var opt = document.createElement("option");
+      opt.value = d;
+      opt.textContent = WEEKDAYS[d];
+      weekday.appendChild(opt);
+    });
+    var start = document.createElement("input");
+    start.type = "time"; start.className = "hour-start"; start.required = true;
+    var dash = document.createElement("span");
+    dash.textContent = "至";
+    var end = document.createElement("input");
+    end.type = "time"; end.className = "hour-end"; end.required = true;
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger";
+    remove.textContent = "删除";
+    remove.addEventListener("click", function () { row.remove(); });
+    row.appendChild(weekday);
+    row.appendChild(start);
+    row.appendChild(dash);
+    row.appendChild(end);
+    row.appendChild(remove);
+    hoursRows.appendChild(row);
+  }
+  document.getElementById("add-hour").addEventListener("click", addHourRow);
+
+  function collectHours() {
+    var rows = hoursRows.querySelectorAll(".hour-row");
+    var hours = [];
+    for (var i = 0; i < rows.length; i++) {
+      var weekday = parseInt(rows[i].querySelector(".hour-weekday").value, 10);
+      var start = rows[i].querySelector(".hour-start").value;
+      var end = rows[i].querySelector(".hour-end").value;
+      if (!start || !end) {
+        return { error: "第 " + (i + 1) + " 个开放时段未填写完整，请补全或删除该时段。" };
+      }
+      hours.push({ weekday: weekday, start: start, end: end });
+    }
+    return { hours: hours };
+  }
+
+  function toMinutes(hhmm) {
+    var parts = hhmm.split(":");
+    return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+  }
+
+  function escapeHTML(value) {
+    return String(value).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function renderVenues(venues) {
+    if (!venues.length) {
+      listBox.innerHTML = '<div class="empty">还没有场地记录。</div>';
+      return;
+    }
+    var sortedHours = function (hours) {
+      return hours.slice().sort(function (a, b) {
+        if (a.weekday !== b.weekday) return a.weekday - b.weekday;
+        return toMinutes(a.start) - toMinutes(b.start);
+      });
+    };
+    listBox.innerHTML = venues.map(function (venue) {
+      var hoursHTML;
+      if (!venue.weeklyHours || !venue.weeklyHours.length) {
+        hoursHTML = '<p class="venue-meta">开放时段：暂未开放</p>';
+      } else {
+        var items = sortedHours(venue.weeklyHours).map(function (h) {
+          var overnight = toMinutes(h.end) < toMinutes(h.start);
+          var endLabel = overnight ? '<span class="next-day">次日 ' + escapeHTML(h.end) + "</span>" : escapeHTML(h.end);
+          return "<li>" + WEEKDAYS[h.weekday] + " " + escapeHTML(h.start) + " – " + endLabel + "</li>";
+        }).join("");
+        hoursHTML = '<ul class="hours">' + items + "</ul>";
+      }
+      return '<article class="venue-card">' +
+        "<h3>" + escapeHTML(venue.name) + "</h3>" +
+        '<p class="venue-meta">容量：' + venue.capacity + " 人</p>" +
+        '<p class="venue-meta">时区：' + escapeHTML(venue.timezone) + "</p>" +
+        hoursHTML +
+        "</article>";
+    }).join("");
+  }
+
+  function loadVenues() {
+    return fetch("/api/venues", { headers: { Accept: "application/json" } })
+      .then(function (res) {
+        if (!res.ok) throw new Error("读取场地列表失败（HTTP " + res.status + "）");
+        return res.json();
+      })
+      .then(function (data) { renderVenues(data.venues || []); })
+      .catch(function (err) {
+        listBox.innerHTML = '<div class="empty">' + escapeHTML(err.message) + "</div>";
+      });
+  }
+
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    clearError();
+
+    var name = document.getElementById("name").value.trim();
+    var capacityRaw = document.getElementById("capacity").value;
+    var timezone = document.getElementById("timezone").value.trim();
+    var capacity = parseInt(capacityRaw, 10);
+
+    if (!name) { showError("保存失败：名称不能为空。"); return; }
+    if (!/^\d+$/.test(capacityRaw) || capacity <= 0) { showError("保存失败：容量必须是正整数。"); return; }
+    if (!timezone) { showError("保存失败：请填写所在时区。"); return; }
+
+    var collected = collectHours();
+    if (collected.error) { showError("保存失败：" + collected.error); return; }
+
+    // 失败时不重置表单，保留全部填写内容。
+    fetch("/api/venues", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        name: name,
+        capacity: capacity,
+        timezone: timezone,
+        weeklyHours: collected.hours
+      })
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (body) {
+        return { ok: res.ok, status: res.status, body: body };
+      });
+    }).then(function (result) {
+      if (!result.ok) {
+        var reason = result.body && result.body.error ? result.body.error : "HTTP " + result.status;
+        showError("保存失败：" + reason);
+        return;
+      }
+      form.reset();
+      hoursRows.innerHTML = "";
+      clearError();
+      return loadVenues();
+    }).catch(function (err) {
+      showError("保存失败：无法连接服务（" + err.message + "），请稍后重试。");
+    });
+  });
+
+  loadVenues();
+})();
+</script>
+</html>

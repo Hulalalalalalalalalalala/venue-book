@@ -16,15 +16,37 @@ go run . --help
 go run . serve --host 127.0.0.1 --port 8080 --data-dir data
 ```
 
-打开 http://127.0.0.1:8080 查看首页。Ctrl+C 停止服务。`--data-dir` 指定本地业务数据目录，重启时继续使用同一目录。
+打开 http://127.0.0.1:8080 查看首页。首页可以直接新增场地（名称、容量、所在时区和每周开放时间），保存成功后立即出现在列表中。Ctrl+C 停止服务。`--data-dir` 指定本地业务数据目录，重启时继续使用同一目录，记录和标识保持不变。
 
 接口：
 
 - `GET /health` 返回服务状态和产品名称。
-- `GET /api/venues` 返回场地列表，首次启动时为空。
-- 未知路径返回 404，已知路径不支持的方法返回 405。
+- `GET /api/venues` 返回场地列表，首次启动时为空，形式为 `{"venues": [...]}`。
+- `POST /api/venues` 新增场地，成功返回 201 和 `{"venue": 记录}`，记录含服务生成的非空唯一 `id`。
+
+`POST /api/venues` 请求体为 JSON 对象：
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` | 名称，字符串，去除首尾空白后不能为空 |
+| `capacity` | 容量，正整数 |
+| `timezone` | 有效的 IANA 时区名称，如 `Asia/Shanghai`；开放时间按场地时区解释 |
+| `weeklyHours` | 每周开放时间数组，允许为空 |
+
+`weeklyHours` 每项包含 `weekday`（1–7 表示周一至周日）、`start`、`end`（严格 `HH:mm`，00:00–23:59）。结束时间晚于开始时间表示当天结束，早于开始时间表示次日结束，两者相同无效。同一项目各时段不能相交或互相包含（前一段结束时下一段开始可以）；跨午夜会检查次日安排，包括周日延续到周一。
+
+示例：
 
 ```sh
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/api/venues
+curl -X POST http://127.0.0.1:8080/api/venues \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"音乐厅","capacity":120,"timezone":"Asia/Shanghai","weeklyHours":[{"weekday":1,"start":"22:00","end":"02:00"}]}'
 ```
+
+错误处理：
+
+- JSON 无效、缺字段、类型错误、时间无效或时段相交返回 400，JSON 的 `error` 字段说明原因，不保存任何部分。
+- 读不到已有数据、数据损坏或保存失败返回 500，不会把损坏数据当作空列表覆盖。
+- 未知路径返回 404；已知路径不支持的方法返回 405，`Allow` 头反映该路径实际支持的方法（`/api/venues` 为 `GET, POST`，其余已知路径为 `GET`）。
