@@ -91,9 +91,30 @@
   var WEEKDAYS = { 1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六", 7: "周日" };
 
   var form = document.getElementById("venue-form");
+  var nameInput = document.getElementById("name");
+  var capacityInput = document.getElementById("capacity");
+  var timezoneInput = document.getElementById("timezone");
   var hoursRows = document.getElementById("hours-rows");
   var errorBox = document.getElementById("form-error");
   var listBox = document.getElementById("venue-list");
+
+  // formEditCount 记录自页面加载以来表单的改动次数（名称、容量、时区发生
+  // 编辑，或开放时段行被新增、删除、修改，各计一次）。保存请求返回较晚时，
+  // 成功回调只能清空发起保存那一刻未再变动的表单；只要等待期间动过任何
+  // 内容——哪怕又改回原值——整份当前表单都必须原样保留继续填写。
+  // 用单调递增的改动计数而不是布尔值，是为了让每个在途请求各自比对发起
+  // 时的计数：先后发了两个保存请求时，先返回的旧请求不会误清后一次提交
+  // 仍在等待的表单。
+  var formEditCount = 0;
+  function markFormChanged() { formEditCount++; }
+  [nameInput, capacityInput, timezoneInput].forEach(function (el) {
+    el.addEventListener("input", markFormChanged);
+    el.addEventListener("change", markFormChanged);
+  });
+  // 时段行的新增与删除通过按钮点击发生；行内输入框由下面的捕获阶段监听
+  // 统一处理（addHourRow 新建的行也自动覆盖，无需逐行绑定）。
+  hoursRows.addEventListener("input", markFormChanged, true);
+  hoursRows.addEventListener("change", markFormChanged, true);
 
   function showError(message) {
     errorBox.textContent = message;
@@ -125,13 +146,14 @@
     remove.type = "button";
     remove.className = "danger";
     remove.textContent = "删除";
-    remove.addEventListener("click", function () { row.remove(); });
+    remove.addEventListener("click", function () { row.remove(); markFormChanged(); });
     row.appendChild(weekday);
     row.appendChild(start);
     row.appendChild(dash);
     row.appendChild(end);
     row.appendChild(remove);
     hoursRows.appendChild(row);
+    markFormChanged();
   }
   document.getElementById("add-hour").addEventListener("click", addHourRow);
 
@@ -296,6 +318,11 @@
     var collected = collectHours();
     if (collected.error) { showError("保存失败：" + collected.error); return; }
 
+    // 记录发起本次保存时的改动计数：响应返回后只有计数未变（等待期间没有
+    // 任何编辑/行变动）才允许清空表单。本次提交的仍是点击保存那一刻收集的
+    // name/capacityDigits/timezone/collected，后续编辑不会改动这份报文。
+    var submittedEditCount = formEditCount;
+
     // 失败时不重置表单，保留全部填写内容。
     fetch("/api/venues", {
       method: "POST",
@@ -310,13 +337,27 @@
     }).then(function (result) {
       if (!result.ok) {
         var reason = result.body && result.body.error ? result.body.error : "HTTP " + result.status;
+        // 服务端拒绝：展示本次保存的失败原因，表单保留用户当前填写的内容
+        // （可能已在等待期间被继续修改），绝不恢复成提交时的旧值。
         showError("保存失败：" + reason);
         return;
       }
+      // 成功只代表“点击保存那一刻的内容”已入库，列表始终来自服务端返回的
+      // 已保存数据，不会混入等待期间的改动。
+      var reload = loadVenues();
+      if (formEditCount !== submittedEditCount) {
+        // 等待期间名称、容量、时区或开放时段被增删改：完整保留当前整份
+        // 表单（含空字段、非法容量或未填完的时段行与行的先后顺序），让
+        // 用户继续填写；这些未提交的内容既不阻止成功记录展示，也不能被
+        // 成功回调清掉。
+        return reload;
+      }
+      // 提交后没有再改任何内容：保持原有成功行为，清空字段、移除时段行、
+      // 消除错误提示。
       form.reset();
       hoursRows.innerHTML = "";
       clearError();
-      return loadVenues();
+      return reload;
     }).catch(function (err) {
       showError("保存失败：无法连接服务（" + err.message + "），请稍后重试。");
     });
