@@ -89,6 +89,11 @@ func (s *store) load() ([]Venue, error) {
 		if venues[i].WeeklyHours == nil {
 			venues[i].WeeklyHours = []WeeklyHour{}
 		}
+		// 已保存的开放时段必须全部合法；任一记录非法即视为业务数据损坏，
+		// 按读取失败处理，绝不能跳过、截短或改写异常时段后继续提供服务。
+		if err := checkWeeklyHours(venues[i].WeeklyHours); err != nil {
+			return nil, fmt.Errorf("venues data is corrupted: venue %q has invalid weekly hours: %w", venues[i].ID, err)
+		}
 	}
 	return venues, nil
 }
@@ -323,18 +328,36 @@ type interval struct {
 	label string
 }
 
-// validateHours 检查所有时段是否相交或互相包含。
+// validateHours 是新增场地时使用的校验入口，错误以 apiError（400）返回。
+func validateHours(hours []WeeklyHour) error {
+	if err := checkWeeklyHours(hours); err != nil {
+		return badRequest("%s", err.Error())
+	}
+	return nil
+}
+
+// checkWeeklyHours 检查所有时段是否合法：星期与时间格式有效、起止不同、
+// 且互不相交或互相包含。返回普通 error，由调用方决定映射为 400 还是 500。
 // 时段按“开始星期 × 开始时间”展开；跨午夜时段延伸到次日。
 // 为检查周日延续到周一的情况，所有时段再复制一份到下一周坐标系。
 // 前一段结束与下一段开始相同时允许保存。
-func validateHours(hours []WeeklyHour) error {
+func checkWeeklyHours(hours []WeeklyHour) error {
 	intervals := make([]interval, 0, len(hours)*2)
-	for _, h := range hours {
+	for i, h := range hours {
+		if h.Weekday < 1 || h.Weekday > 7 {
+			return fmt.Errorf("weeklyHours[%d].weekday 必须为 1 到 7（周一至周日）", i)
+		}
+		if !validHHMM(h.Start) {
+			return fmt.Errorf("weeklyHours[%d].start 时间无效，必须为 00:00 至 23:59 的 HH:mm 格式", i)
+		}
+		if !validHHMM(h.End) {
+			return fmt.Errorf("weeklyHours[%d].end 时间无效，必须为 00:00 至 23:59 的 HH:mm 格式", i)
+		}
 		startMin := minutes(h.Start)
 		endMin := minutes(h.End)
 		label := fmt.Sprintf("%s %s-%s", weekdayName(h.Weekday), h.Start, h.End)
 		if startMin == endMin {
-			return badRequest("开放时段无效：%s 的结束时间与开始时间相同", label)
+			return fmt.Errorf("开放时段无效：%s 的结束时间与开始时间相同", label)
 		}
 		start := (h.Weekday-1)*1440 + startMin
 		end := (h.Weekday-1)*1440 + endMin
@@ -361,7 +384,7 @@ func validateHours(hours []WeeklyHour) error {
 	})
 	for i := 1; i < len(intervals); i++ {
 		if intervals[i].start < intervals[i-1].end {
-			return badRequest("开放时段存在相交：%s 与其他时段重叠", intervals[i].label)
+			return fmt.Errorf("开放时段存在相交：%s 与其他时段重叠", intervals[i].label)
 		}
 	}
 	return nil
