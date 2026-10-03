@@ -259,6 +259,51 @@ const PAGE_SUBMIT = `function () {
   return true;
 }`;
 
+// fillPartial：与 PAGE_FILL 相同的真实注入方式，但允许某行缺少开始或结束
+// 时间（null 表示不填），用于覆盖“某行未填写完整”的前端拦截。
+const PAGE_FILL_PARTIAL = `function (data) {
+  function setValue(el, value) {
+    var proto = el.tagName === "SELECT" ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    var setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+    setter.call(el, String(value));
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  setValue(document.getElementById("name"), data.name || "");
+  setValue(document.getElementById("capacity"), data.capacity || "");
+  setValue(document.getElementById("timezone"), data.timezone || "");
+  document.querySelectorAll("#hours-rows .hour-row").forEach(function (row) { row.remove(); });
+  (data.hours || []).forEach(function (h) {
+    document.getElementById("add-hour").click();
+    var rows = document.querySelectorAll("#hours-rows .hour-row");
+    var row = rows[rows.length - 1];
+    setValue(row.querySelector(".hour-weekday"), h.weekday);
+    if (h.start !== null && h.start !== undefined) setValue(row.querySelector(".hour-start"), h.start);
+    if (h.end !== null && h.end !== undefined) setValue(row.querySelector(".hour-end"), h.end);
+  });
+  return true;
+}`;
+
+// removeAllHours：点击每行的“删除”按钮移除全部开放时段，模拟用户删空。
+const PAGE_REMOVE_ALL_HOURS = `function () {
+  var rows = document.querySelectorAll("#hours-rows .hour-row");
+  rows.forEach(function (row) { row.querySelector("button.danger").click(); });
+  return document.querySelectorAll("#hours-rows .hour-row").length;
+}`;
+
+// changeLastHourStart：只修改最后一行的开始时间，用于在保留上一轮失败
+// 表单内容的前提下做最小纠正。
+const PAGE_CHANGE_LAST_START = `function (value) {
+  var rows = document.querySelectorAll("#hours-rows .hour-row");
+  var row = rows[rows.length - 1];
+  var el = row.querySelector(".hour-start");
+  var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+  setter.call(el, String(value));
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}`;
+
 // state：读取错误提示、表单当前值与场地卡片文本（textContent 即页面
 // 实际展示内容）。
 const PAGE_STATE = `function () {
@@ -271,8 +316,25 @@ const PAGE_STATE = `function () {
     };
   });
   var cards = Array.prototype.map.call(document.querySelectorAll(".venue-card"), function (card) {
+    var tzLine = "";
+    var meta = card.querySelectorAll(".venue-meta");
+    for (var mi = 0; mi < meta.length; mi++) {
+      if (meta[mi].textContent.indexOf("时区：") === 0) { tzLine = meta[mi].textContent; break; }
+    }
+    var chips = Array.prototype.map.call(card.querySelectorAll(".hours li"), function (li) {
+      // textContent 会把跨午夜结束时间的 <span class="next-day">次日 HH:mm</span>
+      // 连同前缀一并读出，正好用于固定“次日”标注。
+      return li.textContent.replace(/\s+/g, " ").trim();
+    });
+    var noHours = false;
+    for (var mj = 0; mj < meta.length; mj++) {
+      if (meta[mj].textContent.indexOf("暂未开放") >= 0) { noHours = true; break; }
+    }
     return {
       name: card.querySelector("h3") ? card.querySelector("h3").textContent : "",
+      tz: tzLine,
+      chips: chips,
+      noHours: noHours,
       text: card.textContent
     };
   });
@@ -347,6 +409,9 @@ async function main() {
 
     const state = () => cdp.eval(`(${PAGE_STATE})()`);
     const fill = (data) => cdp.evalFn(PAGE_FILL, data);
+    const fillPartial = (data) => cdp.evalFn(PAGE_FILL_PARTIAL, data);
+    const removeAllHours = () => cdp.eval(`(${PAGE_REMOVE_ALL_HOURS})()`);
+    const changeLastHourStart = (value) => cdp.evalFn(PAGE_CHANGE_LAST_START, value);
     const submit = () => cdp.eval(`(${PAGE_SUBMIT})()`);
     const findCard = (cards, name) => cards.find((c) => c.name === name) || null;
     const capacityOnCard = (card) => {
@@ -593,6 +658,301 @@ async function main() {
             s0.error && s0.error.indexOf("正整数") >= 0, s0.error);
           check(S, `填写 ${bad2} 后内容保留`, s0.form.capacity === bad2, s0.form.capacity);
         }
+      } catch (e) {
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 6：跨午夜相接时段保存成功，卡片排序、次日标注与时区 ----------
+    {
+      const S = "开放时段跨午夜相接与卡片展示";
+      const name = "夜训馆";
+      const tz = "Asia/Shanghai";
+      // 严格按题目给定顺序填写：周日 22:00-02:00、周一 09:00-12:00、周一 02:00-04:00。
+      const hours = [
+        { weekday: 7, start: "22:00", end: "02:00" },
+        { weekday: 1, start: "09:00", end: "12:00" },
+        { weekday: 1, start: "02:00", end: "04:00" },
+      ];
+      try {
+        await fill({ name, capacity: "150", timezone: tz, hours });
+        const post = await submitAndWaitPost();
+        const raw = await net.postDataOf(post);
+        check(S, "周日跨午夜结束与周一 02:00 开始相接，服务端返回 201",
+          post.status === 201, `status=${post.status} body=${raw}`);
+
+        // 请求体中的 weeklyHours 必须按填写原文与顺序提交，时间不被换算。
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch (e) { bad(S, "请求体是合法 JSON: " + e.message, raw); }
+        if (parsed) {
+          const same = Array.isArray(parsed.weeklyHours) &&
+            parsed.weeklyHours.length === 3 &&
+            hours.every((w, i) => {
+              const g = parsed.weeklyHours[i];
+              return g.weekday === w.weekday && g.start === w.start && g.end === w.end;
+            });
+          check(S, "三个时段按星期/起止时间原文与填写顺序提交", same,
+            JSON.stringify(parsed && parsed.weeklyHours));
+          check(S, "请求携带填写的时区且不换算时间", parsed.timezone === tz, parsed.timezone);
+        }
+
+        const s0 = await state();
+        check(S, "保存成功无错误提示", s0.error === null, s0.error);
+        const card = findCard(s0.cards, name);
+        check(S, "新增场地立即出现在列表中", !!card,
+          JSON.stringify(s0.cards.map((c) => c.name)));
+        if (card) {
+          check(S, "卡片显示填写的时区", card.tz === "时区：" + tz, card.tz);
+          check(S, "卡片展示三段开放时间", card.chips.length === 3, JSON.stringify(card.chips));
+          // 按星期及开始时间排列：周一两段（02:00 早于 09:00）在前，周日在最后。
+          check(S, "卡片排序为周一 02:00、周一 09:00、周日 22:00",
+            card.chips.length === 3 &&
+              card.chips[0].indexOf("周一 02:00") === 0 &&
+              card.chips[1].indexOf("周一 09:00") === 0 &&
+              card.chips[2].indexOf("周日 22:00") === 0,
+            JSON.stringify(card.chips));
+          // 跨午夜的结束时间必须明确标注“次日 02:00”，不能换算或改写。
+          check(S, "周日跨午夜结束明确显示“次日 02:00”",
+            /周日 22:00\s*[–-]\s*次日\s*02:00/.test(card.chips[2]),
+            JSON.stringify(card.chips));
+          check(S, "当天结束时段不标注次日且时间不换算",
+            card.chips[1] === "周一 09:00 – 12:00", JSON.stringify(card.chips));
+          check(S, "跨午夜时间不被改成当天结束（24:00/00:00）",
+            card.chips[2].indexOf("24:00") === -1 && card.chips[2].indexOf("00:00") === -1,
+            JSON.stringify(card.chips));
+        }
+
+        // 保存成功后表单清空，开放时段行移除。
+        check(S, "成功后名称清空", s0.form.name === "", JSON.stringify(s0.form.name));
+        check(S, "成功后容量清空", s0.form.capacity === "", JSON.stringify(s0.form.capacity));
+        check(S, "成功后时区清空", s0.form.timezone === "", JSON.stringify(s0.form.timezone));
+        check(S, "成功后开放时段行全部移除", s0.form.hours.length === 0,
+          JSON.stringify(s0.form.hours));
+
+        // 重新加载：排序、次日标注与时区均来自保存数据，保持一致。
+        const getsBefore = net.venueGets().length;
+        await navigate();
+        await poll(async () => {
+          const got = net.venueGets().slice(getsBefore);
+          return got.length ? got[got.length - 1] : null;
+        }, { timeout: 8000, label: "重新读取列表" });
+        await poll(async () => findCard((await state()).cards, name),
+          { timeout: 8000, label: "重新读取后卡片出现" });
+        const card2 = findCard((await state()).cards, name);
+        check(S, "重新读取后时区不变", !!card2 && card2.tz === "时区：" + tz,
+          card2 ? card2.tz : null);
+        check(S, "重新读取后仍为周一两段在前、周日在最后",
+          !!card2 && card2.chips.length === 3 &&
+            card2.chips[0].indexOf("周一 02:00") === 0 &&
+            card2.chips[1].indexOf("周一 09:00") === 0 &&
+            card2.chips[2].indexOf("周日 22:00") === 0,
+          card2 ? JSON.stringify(card2.chips) : null);
+        check(S, "重新读取后仍明确标注次日 02:00",
+          !!card2 && /次日\s*02:00/.test(card2.chips[2]),
+          card2 ? JSON.stringify(card2.chips) : null);
+      } catch (e) {
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 7：跨周重叠返回 400，内容全部保留；改成 02:00 后成功 ----------
+    {
+      const S = "跨周重叠被拒绝并可纠正";
+      const name = "周末连场";
+      const tz = "UTC";
+      try {
+        const beforeNames = (await state()).cards.map((c) => c.name);
+        await fill({
+          name, capacity: "66", timezone: tz,
+          hours: [
+            { weekday: 7, start: "22:00", end: "02:00" },
+            { weekday: 1, start: "01:00", end: "03:00" },
+          ],
+        });
+        const post = await submitAndWaitPost();
+        check(S, "周日延续到周一与周一时段重叠，服务端返回 400",
+          post.status === 400, `status=${post.status}`);
+
+        const errBody = await net.bodyOf(post);
+        let serverMsg = "";
+        try { serverMsg = JSON.parse(errBody).error || ""; } catch { /* ignore */ }
+        check(S, "服务端错误说明时段相交/重叠",
+          serverMsg.indexOf("重叠") >= 0 || serverMsg.indexOf("相交") >= 0, errBody);
+
+        const after = await state();
+        check(S, "页面展示重叠原因",
+          !!after.error &&
+            (after.error.indexOf("重叠") >= 0 || after.error.indexOf("相交") >= 0),
+          after.error);
+        const afterNames = after.cards.map((c) => c.name);
+        check(S, "失败后列表不增加记录，已有场地不受影响",
+          afterNames.length === beforeNames.length &&
+            afterNames.every((n) => beforeNames.indexOf(n) >= 0),
+          JSON.stringify({ before: beforeNames, after: afterNames }));
+
+        // 名称、容量、时区以及每行星期、起止时间与填写顺序全部保留。
+        check(S, "失败后名称保留", after.form.name === name, after.form.name);
+        check(S, "失败后容量保留", after.form.capacity === "66", after.form.capacity);
+        check(S, "失败后时区保留", after.form.timezone === tz, after.form.timezone);
+        const h = after.form.hours;
+        check(S, "失败后两行时段内容与顺序保留",
+          h.length === 2 &&
+            h[0].weekday === "7" && h[0].start === "22:00" && h[0].end === "02:00" &&
+            h[1].weekday === "1" && h[1].start === "01:00" && h[1].end === "03:00",
+          JSON.stringify(h));
+
+        // 只把周一（最后一行）开始时间改成 02:00，其余一律不动，再次保存。
+        await changeLastHourStart("02:00");
+        const post2 = await submitAndWaitPost();
+        check(S, "只改周一开始时间为 02:00 后服务端返回 201",
+          post2.status === 201, `status=${post2.status}`);
+        const raw2 = await net.postDataOf(post2);
+        let parsed2 = null;
+        try { parsed2 = raw2 && JSON.parse(raw2); } catch { /* ignore */ }
+        check(S, "第二次请求保留上一轮内容，仅周一开始时间变为 02:00",
+          !!parsed2 && parsed2.name === name && parsed2.capacity === 66 &&
+            parsed2.timezone === tz && parsed2.weeklyHours.length === 2 &&
+            parsed2.weeklyHours[0].weekday === 7 &&
+            parsed2.weeklyHours[0].start === "22:00" && parsed2.weeklyHours[0].end === "02:00" &&
+            parsed2.weeklyHours[1].weekday === 1 &&
+            parsed2.weeklyHours[1].start === "02:00" && parsed2.weeklyHours[1].end === "03:00",
+          raw2);
+
+        const fixed = await state();
+        check(S, "纠正成功后旧错误消失", fixed.error === null, fixed.error);
+        const card = findCard(fixed.cards, name);
+        check(S, "纠正后新增场地卡片", !!card,
+          JSON.stringify(fixed.cards.map((c) => c.name)));
+        if (card) {
+          check(S, "纠正后卡片时区仍为填写值", card.tz === "时区：UTC", card.tz);
+          check(S, "纠正后卡片周一在前、周日跨午夜标注次日",
+            card.chips.length === 2 &&
+              card.chips[0].indexOf("周一 02:00 – 03:00") === 0 &&
+              /周日 22:00\s*[–-]\s*次日\s*02:00/.test(card.chips[1]),
+            JSON.stringify(card.chips));
+        }
+      } catch (e) {
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 8：某行缺少开始/结束时间：指出具体行、阻止保存、保留内容 ----------
+    {
+      const S = "开放时段行不完整";
+      const cases = [
+        {
+          label: "首行缺结束时间",
+          hours: [{ weekday: 7, start: "22:00", end: null }],
+          expectMsg: "第 1 个开放时段未填写完整",
+          expectRows: [{ weekday: "7", start: "22:00", end: "" }],
+        },
+        {
+          label: "首行缺开始时间",
+          hours: [{ weekday: 3, start: null, end: "18:00" }],
+          expectMsg: "第 1 个开放时段未填写完整",
+          expectRows: [{ weekday: "3", start: "", end: "18:00" }],
+        },
+        {
+          label: "第二行缺结束时间",
+          hours: [
+            { weekday: 1, start: "09:00", end: "12:00" },
+            { weekday: 2, start: "13:00", end: null },
+          ],
+          expectMsg: "第 2 个开放时段未填写完整",
+          expectRows: [
+            { weekday: "1", start: "09:00", end: "12:00" },
+            { weekday: "2", start: "13:00", end: "" },
+          ],
+        },
+      ];
+      try {
+        for (const c of cases) {
+          await fillPartial({
+            name: "未填完馆", capacity: "42", timezone: "Asia/Tokyo", hours: c.hours,
+          });
+          const postsBefore = net.snapshot().filter((r) => r.method === "POST").length;
+          await submit();
+          await sleep(350);
+          const postsSent = net.snapshot().filter((r) => r.method === "POST").length -
+            postsBefore;
+          const s0 = await state();
+          check(S, `[${c.label}] 阻止保存且不发送请求`, postsSent === 0,
+            `POST 数量 ${postsSent}`);
+          check(S, `[${c.label}] 指出该行未填写完整`,
+            s0.error && s0.error.indexOf(c.expectMsg) >= 0, s0.error);
+          check(S, `[${c.label}] 名称/容量/时区保留`,
+            s0.form.name === "未填完馆" && s0.form.capacity === "42" &&
+              s0.form.timezone === "Asia/Tokyo",
+            JSON.stringify({
+              name: s0.form.name, capacity: s0.form.capacity, timezone: s0.form.timezone,
+            }));
+          const rowsOk = s0.form.hours.length === c.expectRows.length &&
+            c.expectRows.every((w, i) => {
+              const g = s0.form.hours[i];
+              return g.weekday === w.weekday && g.start === w.start && g.end === w.end;
+            });
+          check(S, `[${c.label}] 已填写的星期与时间保留`, rowsOk,
+            JSON.stringify(s0.form.hours));
+        }
+      } catch (e) {
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 9：删除全部开放时段后仍可保存，卡片显示“暂未开放” ----------
+    {
+      const S = "删除全部时段后可保存";
+      const name = "暂未定档厅";
+      try {
+        const beforeNames = (await state()).cards.map((c) => c.name);
+        // 先加两行再逐行点“删除”，覆盖删除交互以及空数组不等于错误。
+        await fill({
+          name, capacity: "30", timezone: "Europe/London",
+          hours: [
+            { weekday: 1, start: "09:00", end: "12:00" },
+            { weekday: 7, start: "20:00", end: "23:00" },
+          ],
+        });
+        const remaining = await removeAllHours();
+        check(S, "点击删除后页面无开放时段行", remaining === 0, `remaining=${remaining}`);
+
+        const post = await submitAndWaitPost();
+        const raw = await net.postDataOf(post);
+        check(S, "无时段的合法场地服务端返回 201", post.status === 201,
+          `status=${post.status} body=${raw}`);
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch { /* ignore */ }
+        check(S, "请求 weeklyHours 是空数组而非缺省或 null",
+          !!parsed && Array.isArray(parsed.weeklyHours) && parsed.weeklyHours.length === 0, raw);
+
+        const s0 = await state();
+        check(S, "无时段保存不出现错误提示", s0.error === null, s0.error);
+        const afterNames = s0.cards.map((c) => c.name);
+        check(S, "无时段场地立即出现在列表",
+          afterNames.indexOf(name) >= 0 && afterNames.length === beforeNames.length + 1,
+          JSON.stringify({ before: beforeNames, after: afterNames }));
+        const card = findCard(s0.cards, name);
+        if (card) {
+          check(S, "卡片显示“开放时段：暂未开放”",
+            card.noHours && card.text.indexOf("开放时段：暂未开放") >= 0, card.text);
+          check(S, "空数组不渲染任何时段标签", card.chips.length === 0,
+            JSON.stringify(card.chips));
+          check(S, "卡片时区照常显示", card.tz === "时区：Europe/London", card.tz);
+        }
+
+        // 重新加载后仍为“暂未开放”。
+        const getsBefore = net.venueGets().length;
+        await navigate();
+        await poll(async () => {
+          const got = net.venueGets().slice(getsBefore);
+          return got.length ? got[got.length - 1] : null;
+        }, { timeout: 8000, label: "重新读取列表" });
+        await poll(async () => findCard((await state()).cards, name),
+          { timeout: 8000, label: "重新读取后卡片出现" });
+        const card2 = findCard((await state()).cards, name);
+        check(S, "重新读取后仍显示“暂未开放”且无时段标签",
+          !!card2 && card2.noHours && card2.chips.length === 0,
+          card2 ? card2.text : null);
       } catch (e) {
         bad(S, "场景执行中断: " + e.message, e.stack);
       }
