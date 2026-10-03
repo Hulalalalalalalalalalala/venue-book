@@ -277,7 +277,14 @@
     }).join("");
   }
 
+  // 列表读取可能并发在途：页面打开时的首次读取尚未返回，保存成功后又会发
+  // 出新的读取。响应返回顺序不保证与发起顺序一致，若旧响应后返回，会把已
+  // 显示的新列表盖掉（旧失败也会覆盖新成功）。用发起序号标识每一次读取，
+  // 只有最新一次读取的响应——无论成功还是失败——才允许更新列表区域；之
+  // 前尚未结束的读取随后无论返回什么都不再影响界面。
+  var loadSequence = 0;
   function loadVenues() {
+    var thisLoad = ++loadSequence;
     return fetch("/api/venues", { headers: { Accept: "application/json" } })
       .then(function (res) {
         if (!res.ok) throw new Error("读取场地列表失败（HTTP " + res.status + "）");
@@ -290,9 +297,11 @@
         } catch (e) {
           throw new Error("读取场地列表失败：响应不是有效的 JSON");
         }
+        if (thisLoad !== loadSequence) return; // 已有更新的读取发出，忽略旧结果
         renderVenues(data.venues || []);
       })
       .catch(function (err) {
+        if (thisLoad !== loadSequence) return; // 旧读取的失败不覆盖新读取的结果
         listBox.innerHTML = '<div class="empty">' + escapeHTML(err.message) + "</div>";
       });
   }
