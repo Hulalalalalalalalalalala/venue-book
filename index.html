@@ -161,6 +161,74 @@
     });
   }
 
+  // canonicalDigits 按十进制原文校验容量输入：只接受由数字组成的正整数，
+  // 返回去掉前导零后的数字原文；为空、为零或包含负号、小数点等内容时返回
+  // null。全程不经过 Number/parseInt，否则 9007199254740993 这样超过
+  // Number.MAX_SAFE_INTEGER 的值会被悄悄舍入成相邻整数。
+  function canonicalDigits(raw) {
+    if (!/^\d+$/.test(raw)) return null;
+    var digits = raw.replace(/^0+/, "");
+    if (digits === "") return null; // 全是 0：容量为零，不接受
+    return digits;
+  }
+
+  // buildVenueRequestBody 直接拼接 JSON 文本，让容量以输入的十进制数字原文
+  // 发送：不能用 JSON.stringify({capacity: 数字})，大整数在转成 Number 时
+  // 已经被舍入，stringify 只会写回错误的值。名称、时区是字符串，交给
+  // JSON.stringify 转义；传输报文中 capacity 仍是 JSON 数字。
+  function buildVenueRequestBody(name, capacityDigits, timezone, hours) {
+    return "{" +
+      '"name":' + JSON.stringify(name) +
+      ',"capacity":' + capacityDigits +
+      ',"timezone":' + JSON.stringify(timezone) +
+      ',"weeklyHours":' + JSON.stringify(hours) +
+      "}";
+  }
+
+  // parseVenuesJSON 解析场地列表，但保留 capacity 数字的十进制原文：
+  // JSON.parse 会把数字存成 float64，超过 2^53 的容量会被舍入成相邻整数。
+  // 这里逐字符扫描 JSON（正确处理字符串内的转义引号），仅当 "capacity"
+  // 作为对象键出现时，把其后数字的原文包成字符串，页面拿到的就是服务端
+  // 逐位发出的完整十进制数字（服务端只输出普通整数，不会出现科学计数法）。
+  // 名称等其它字段一律原样复制，绝不改写；线上传输的 JSON 中 capacity
+  // 仍是数字，接口格式不变。
+  function parseVenuesJSON(text) {
+    var out = "", i = 0, n = text.length;
+    while (i < n) {
+      if (text[i] !== '"') {
+        out += text[i];
+        i++;
+        continue;
+      }
+      // 读取完整字符串，跳过转义字符，使名称中出现的 \"capacity\":1
+      // 之类文本不会被误认为对象键。
+      var tokenStart = i, j = i + 1;
+      while (j < n) {
+        if (text[j] === "\\") { j += 2; continue; }
+        if (text[j] === '"') { j++; break; }
+        j++;
+      }
+      var token = text.slice(tokenStart, j);
+      // 对象键后面（允许空白）必然是 ':'；字符串值后面只能是 ',' 或 '}'。
+      var k = j;
+      while (k < n && /\s/.test(text[k])) k++;
+      if (text[k] !== ":" || JSON.parse(token) !== "capacity") {
+        out += token;
+        i = j;
+        continue;
+      }
+      // 复制到 ':' 之后（含中间空白），再把数字原文引用为字符串。
+      out += token + text.slice(j, k + 1);
+      var p = k + 1;
+      while (p < n && /\s/.test(text[p])) { out += text[p]; p++; }
+      var numStart = p;
+      while (p < n && /[-+0-9eE.]/.test(text[p])) p++;
+      out += JSON.stringify(text.slice(numStart, p));
+      i = p;
+    }
+    return JSON.parse(out);
+  }
+
   function renderVenues(venues) {
     if (!venues.length) {
       listBox.innerHTML = '<div class="empty">还没有场地记录。</div>';
@@ -186,7 +254,7 @@
       }
       return '<article class="venue-card">' +
         "<h3>" + escapeHTML(venue.name) + "</h3>" +
-        '<p class="venue-meta">容量：' + venue.capacity + " 人</p>" +
+        '<p class="venue-meta">容量：' + escapeHTML(venue.capacity) + " 人</p>" +
         '<p class="venue-meta">时区：' + escapeHTML(venue.timezone) + "</p>" +
         hoursHTML +
         "</article>";
@@ -197,9 +265,17 @@
     return fetch("/api/venues", { headers: { Accept: "application/json" } })
       .then(function (res) {
         if (!res.ok) throw new Error("读取场地列表失败（HTTP " + res.status + "）");
-        return res.json();
+        return res.text();
       })
-      .then(function (data) { renderVenues(data.venues || []); })
+      .then(function (text) {
+        var data;
+        try {
+          data = parseVenuesJSON(text);
+        } catch (e) {
+          throw new Error("读取场地列表失败：响应不是有效的 JSON");
+        }
+        renderVenues(data.venues || []);
+      })
       .catch(function (err) {
         listBox.innerHTML = '<div class="empty">' + escapeHTML(err.message) + "</div>";
       });
@@ -210,12 +286,11 @@
     clearError();
 
     var name = document.getElementById("name").value.trim();
-    var capacityRaw = document.getElementById("capacity").value;
+    var capacityDigits = canonicalDigits(document.getElementById("capacity").value);
     var timezone = document.getElementById("timezone").value.trim();
-    var capacity = parseInt(capacityRaw, 10);
 
     if (!name) { showError("保存失败：名称不能为空。"); return; }
-    if (!/^\d+$/.test(capacityRaw) || capacity <= 0) { showError("保存失败：容量必须是正整数。"); return; }
+    if (capacityDigits === null) { showError("保存失败：容量必须是正整数。"); return; }
     if (!timezone) { showError("保存失败：请填写所在时区。"); return; }
 
     var collected = collectHours();
@@ -225,12 +300,9 @@
     fetch("/api/venues", {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({
-        name: name,
-        capacity: capacity,
-        timezone: timezone,
-        weeklyHours: collected.hours
-      })
+      // 容量按输入的十进制原文作为 JSON 数字发送，不经过 Number/parseInt：
+      // 是否超出服务端范围由服务端按这个准确整数判断，绝不先舍入再提交。
+      body: buildVenueRequestBody(name, capacityDigits, timezone, collected.hours)
     }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (body) {
         return { ok: res.ok, status: res.status, body: body };
