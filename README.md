@@ -16,7 +16,7 @@ go run . --help
 go test ./...
 ```
 
-`TestHomepageCapacityBrowserE2E` 覆盖首页“表单填写 → 提交 → 列表显示”的完整链路（含超过 2^53 的容量逐位准确提交/显示、特殊字符名称、超范围拒绝后保留填写内容）。它会启动真实 HTTP 服务并用 Node（≥22，用到全局 `WebSocket`）通过 CDP 驱动本机无头 Chrome，无需安装 npm 依赖；找不到 node 或 Chrome/Chromium 时自动跳过，可用 `CHROME_BIN` 指定浏览器路径。浏览器脚本位于 `testdata/homepage_browser_test.mjs`。
+`TestHomepageBrowserE2E` 覆盖首页“表单填写 → 提交 → 列表显示”的完整链路：含超过 2^53 的容量逐位准确提交/显示、特殊字符名称、超范围拒绝后保留填写内容，以及每周开放时段的填写、保存与卡片展示（按星期及开始时间排列、跨午夜结束标注“次日”、时区原样显示）、跨周重叠被 400 拒绝后保留全部填写并可纠正、某行未填写完整时页面拦截、删除全部时段后保存并显示“暂未开放”。它会启动真实 HTTP 服务并用 Node（≥22，用到全局 `WebSocket`）通过 CDP 驱动本机无头 Chrome，无需安装 npm 依赖；找不到 node 或 Chrome/Chromium 时自动跳过，可用 `CHROME_BIN` 指定浏览器路径。浏览器脚本位于 `testdata/homepage_browser_test.mjs`。
 
 启动本地服务：
 

@@ -12,13 +12,15 @@ import (
 	"time"
 )
 
-// 首页容量准确性端到端回归：
+// 首页浏览器端到端回归：
 //
-// 服务端的精确整数校验已由 HTTP 层测试覆盖；这里补上“用户在首页表单填写
-// → 浏览器提交 → 服务端保存 → 首页列表显示”这一段的保障。测试启动真实
-// HTTP 服务（httptest）与本机无头 Chrome，由 testdata/homepage_browser_test.mjs
-// 通过 Chrome DevTools Protocol 驱动真实首页，逐字节检查请求/响应中的
-// capacity，并验证列表显示与失败时的表单保留行为。
+// 服务端的精确整数校验与时段规则已由 HTTP 层测试覆盖；这里补上“用户在首页
+// 表单填写 → 浏览器提交 → 服务端保存 → 首页列表显示”这一段的保障，覆盖容量
+// 逐位准确提交/显示，以及每周开放时段的填写、保存、卡片排序展示（含跨午夜
+// “次日”标注）、跨周重叠拒绝后保留填写内容、不完整行拦截与删除全部时段后
+// 显示“暂未开放”。测试启动真实 HTTP 服务（httptest）与本机无头 Chrome，由
+// testdata/homepage_browser_test.mjs 通过 Chrome DevTools Protocol 驱动真实
+// 首页，逐字节检查请求/响应内容，并验证列表显示与失败时的表单保留行为。
 //
 // 脚本不依赖任何 npm 包（Node ≥22 的全局 WebSocket 即可），在缺少 node 或
 // Chrome 的环境中跳过，保证其余测试照常运行。可用 CHROME_BIN 指定浏览器。
@@ -51,7 +53,7 @@ func findExecutable(t *testing.T, names []string, candidates []string) string {
 	return ""
 }
 
-func TestHomepageCapacityBrowserE2E(t *testing.T) {
+func TestHomepageBrowserE2E(t *testing.T) {
 	nodeBin := findExecutable(t, []string{"node"}, []string{
 		"/opt/gsb-production/bin/node",
 		"/usr/local/bin/node",
@@ -130,7 +132,7 @@ func TestHomepageCapacityBrowserE2E(t *testing.T) {
 		})
 	}
 	if failures > 0 {
-		t.Fatalf("首页容量端到端回归共有 %d 项失败", failures)
+		t.Fatalf("首页浏览器端到端回归共有 %d 项失败", failures)
 	}
 }
 
