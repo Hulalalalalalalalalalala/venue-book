@@ -71,8 +71,9 @@ func newStore(dataDir string) (*store, error) {
 	return &store{path: path}, nil
 }
 
-// load 读取并解析全部记录。读不到、JSON 损坏或结构异常都返回错误，
-// 调用方必须按 500 处理，绝不能把错误数据当作空列表覆盖。
+// load 读取并解析全部记录。读不到、JSON 损坏、结构异常或任一场地的
+// 开放时段不合法都返回错误，调用方必须按 500 处理，绝不能把错误数据
+// 当作空列表覆盖，也不能跳过异常场地只返回剩余记录。
 func (s *store) load() ([]Venue, error) {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
@@ -86,8 +87,13 @@ func (s *store) load() ([]Venue, error) {
 		venues = []Venue{}
 	}
 	for i := range venues {
+		// 兼容旧数据：字段缺省或为 null 仍按空数组（暂未开放）读取。
 		if venues[i].WeeklyHours == nil {
 			venues[i].WeeklyHours = []WeeklyHour{}
+		}
+		// 已保存数据同样必须满足新增时的全部时段规则；任一非法即视为损坏。
+		if err := validateHours(venues[i].WeeklyHours); err != nil {
+			return nil, fmt.Errorf("venues data is corrupted: venue %q has invalid weekly hours: %w", venues[i].ID, err)
 		}
 	}
 	return venues, nil
@@ -191,7 +197,9 @@ func buildVenue(payload map[string]any) (Venue, error) {
 		return Venue{}, err
 	}
 	if err := validateHours(hours); err != nil {
-		return Venue{}, err
+		// 读取已保存数据时 validateHours 的错误按数据损坏（500）处理；
+		// 这里是新增请求，包装成面向客户端的 400 校验错误。
+		return Venue{}, badRequest("%s", err.Error())
 	}
 
 	return Venue{
@@ -323,18 +331,30 @@ type interval struct {
 	label string
 }
 
-// validateHours 检查所有时段是否相交或互相包含。
-// 时段按“开始星期 × 开始时间”展开；跨午夜时段延伸到次日。
-// 为检查周日延续到周一的情况，所有时段再复制一份到下一周坐标系。
-// 前一段结束与下一段开始相同时允许保存。
+// validateHours 按开放时段的业务规则检查一段已解析的时段数据。
+// 规则同时用于新增请求（400 校验）和已保存数据（损坏时按 500 处理）：
+// 星期为 1–7（周一至周日），时间为严格 HH:mm（00:00–23:59），
+// 起止时间不能相同；结束早于开始表示次日结束。重叠判断覆盖跨午夜
+// 延续到次日的部分，也包含周日延续到下周一的部分；部分重叠、完全
+// 包含和重复时段都不合法，下一段恰好在前一段结束时开始合法。
+// 时段的填写顺序不影响结果。
+//
+// 返回的是普通错误而非 apiError：读取已保存数据命中时按数据损坏（500）
+// 处理；新增流程由 buildVenue 包装成面向客户端的 400 错误。
 func validateHours(hours []WeeklyHour) error {
 	intervals := make([]interval, 0, len(hours)*2)
 	for _, h := range hours {
+		if h.Weekday < 1 || h.Weekday > 7 {
+			return fmt.Errorf("开放时段无效：星期 %d 不在 1 到 7（周一至周日）范围内", h.Weekday)
+		}
+		if !validHHMM(h.Start) || !validHHMM(h.End) {
+			return fmt.Errorf("开放时段无效：%s 的时间 %s-%s 不是合法的 HH:mm", weekdayName(h.Weekday), h.Start, h.End)
+		}
 		startMin := minutes(h.Start)
 		endMin := minutes(h.End)
 		label := fmt.Sprintf("%s %s-%s", weekdayName(h.Weekday), h.Start, h.End)
 		if startMin == endMin {
-			return badRequest("开放时段无效：%s 的结束时间与开始时间相同", label)
+			return fmt.Errorf("开放时段无效：%s 的结束时间与开始时间相同", label)
 		}
 		start := (h.Weekday-1)*1440 + startMin
 		end := (h.Weekday-1)*1440 + endMin
@@ -361,7 +381,7 @@ func validateHours(hours []WeeklyHour) error {
 	})
 	for i := 1; i < len(intervals); i++ {
 		if intervals[i].start < intervals[i-1].end {
-			return badRequest("开放时段存在相交：%s 与其他时段重叠", intervals[i].label)
+			return fmt.Errorf("开放时段存在相交：%s 与其他时段重叠", intervals[i].label)
 		}
 	}
 	return nil

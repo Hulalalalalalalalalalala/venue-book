@@ -448,3 +448,232 @@ func TestEmptyDataDirStillInitializes(t *testing.T) {
 		t.Fatalf("fresh dir should be empty, got %d", len(venues))
 	}
 }
+
+// writeVenuesFile 直接写入原始记录，绕过新增时的校验，用于模拟已损坏的存量数据。
+func writeVenuesFile(t *testing.T, s *store, venues any) string {
+	t.Helper()
+	raw, err := json.Marshal(venues)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(s.path, raw, 0600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	return string(raw)
+}
+
+// TestInvalidSavedHoursTreatedAsCorruption 验证需求中的核心场景：
+// 已有场地周日开放到次日凌晨两点、同时周一凌晨一点开放（两段重叠）。
+func TestInvalidSavedHoursTreatedAsCorruption(t *testing.T) {
+	cases := []struct {
+		name   string
+		venues []Venue
+	}{
+		{
+			"sunday spills into monday",
+			[]Venue{{
+				ID: "v-sunday", Name: "屋顶球场", Capacity: 50, Timezone: "Asia/Shanghai",
+				WeeklyHours: []WeeklyHour{
+					{Weekday: 7, Start: "22:00", End: "02:00"},
+					{Weekday: 1, Start: "01:00", End: "03:00"},
+				},
+			}},
+		},
+		{"equal start and end", []Venue{{
+			ID: "v-equal", Name: "展厅", Capacity: 10, Timezone: "UTC",
+			WeeklyHours: []WeeklyHour{{Weekday: 2, Start: "10:00", End: "10:00"}},
+		}}},
+		{"duplicate slot", []Venue{{
+			ID: "v-dup", Name: "排练室", Capacity: 4, Timezone: "UTC",
+			WeeklyHours: []WeeklyHour{
+				{Weekday: 3, Start: "09:00", End: "11:00"},
+				{Weekday: 3, Start: "09:00", End: "11:00"},
+			},
+		}}},
+		{"containment", []Venue{{
+			ID: "v-contain", Name: "礼堂", Capacity: 300, Timezone: "UTC",
+			WeeklyHours: []WeeklyHour{
+				{Weekday: 4, Start: "08:00", End: "20:00"},
+				{Weekday: 4, Start: "09:00", End: "10:00"},
+			},
+		}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, h := newTestServer(t)
+			original := writeVenuesFile(t, s, tc.venues)
+
+			// GET 必须 500：带非空 error，不返回场地列表，也不只显示正常场地。
+			rec := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("GET invalid hours: status = %d, want 500, body = %s", rec.Code, rec.Body.String())
+			}
+			body := decodeBody(t, rec)
+			if msg, _ := body["error"].(string); msg == "" {
+				t.Fatalf("500 response must carry non-empty error, got %v", body)
+			}
+			if _, present := body["venues"]; present {
+				t.Fatalf("corrupted store must not return a venues list, got %v", body)
+			}
+
+			// 提交内容合法的新场地同样 500，不新增、不追加、不改写异常时段。
+			rec = doJSON(t, h, http.MethodPost, "/api/venues", validPayload())
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("POST with corrupted store: status = %d, want 500, body = %s", rec.Code, rec.Body.String())
+			}
+			postBody := decodeBody(t, rec)
+			if msg, _ := postBody["error"].(string); msg == "" {
+				t.Fatalf("POST 500 must carry non-empty error, got %v", postBody)
+			}
+			after, err := os.ReadFile(s.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != original {
+				t.Fatalf("corrupted records must be preserved untouched:\nbefore=%s\nafter =%s", original, string(after))
+			}
+
+			// 损坏未修复前读取仍应持续失败。
+			rec = doJSON(t, h, http.MethodGet, "/api/venues", nil)
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("second GET should still be 500, got %d", rec.Code)
+			}
+		})
+	}
+}
+
+// TestCorruptVenueAlongsideValidOneRejectsWholeList 异常场地与正常场地并存时，
+// 不能跳过异常场地只返回剩余记录。
+func TestCorruptVenueAlongsideValidOneRejectsWholeList(t *testing.T) {
+	s, h := newTestServer(t)
+	writeVenuesFile(t, s, []Venue{
+		{
+			ID: "v-ok", Name: "正常场地", Capacity: 20, Timezone: "UTC",
+			WeeklyHours: []WeeklyHour{{Weekday: 1, Start: "09:00", End: "12:00"}},
+		},
+		{
+			ID: "v-bad", Name: "异常场地", Capacity: 20, Timezone: "UTC",
+			WeeklyHours: []WeeklyHour{
+				{Weekday: 7, Start: "22:00", End: "02:00"},
+				{Weekday: 1, Start: "01:00", End: "03:00"},
+			},
+		},
+	})
+	rec := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body = %s", rec.Code, rec.Body.String())
+	}
+	if _, present := decodeBody(t, rec)["venues"]; present {
+		t.Fatalf("must not return a partial list of the valid venue")
+	}
+}
+
+// TestStoredHoursStructuralProblemsAreCorruption 存量记录中星期越界或时间格式
+// 非法（新增请求本会拒绝的结构问题）同样按数据损坏处理。
+func TestStoredHoursStructuralProblemsAreCorruption(t *testing.T) {
+	s, h := newTestServer(t)
+	writeVenuesFile(t, s, []Venue{{
+		ID: "v-weird", Name: "问题场地", Capacity: 8, Timezone: "UTC",
+		WeeklyHours: []WeeklyHour{{Weekday: 9, Start: "10:00", End: "11:00"}},
+	}})
+	if rec := doJSON(t, h, http.MethodGet, "/api/venues", nil); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("bad weekday in store: status = %d, want 500", rec.Code)
+	}
+
+	writeVenuesFile(t, s, []Venue{{
+		ID: "v-weird2", Name: "问题场地", Capacity: 8, Timezone: "UTC",
+		WeeklyHours: []WeeklyHour{{Weekday: 1, Start: "25:00", End: "11:00"}},
+	}})
+	if rec := doJSON(t, h, http.MethodGet, "/api/venues", nil); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("bad time in store: status = %d, want 500", rec.Code)
+	}
+}
+
+// TestLegacyNullWeeklyHoursReadAsEmpty 兼容旧数据：weeklyHours 为 null 或
+// 缺省时按空数组读取，且这种数据之上仍可继续新增合法场地。
+func TestLegacyNullWeeklyHoursReadAsEmpty(t *testing.T) {
+	s, h := newTestServer(t)
+	writeVenuesFile(t, s, []map[string]any{
+		{"id": "v-null", "name": "旧场地甲", "capacity": 10, "timezone": "UTC", "weeklyHours": nil},
+		{"id": "v-missing", "name": "旧场地乙", "capacity": 12, "timezone": "UTC"},
+	})
+
+	rec := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy null/missing hours should still load: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	venues := decodeBody(t, rec)["venues"].([]any)
+	if len(venues) != 2 {
+		t.Fatalf("expected both legacy venues, got %v", venues)
+	}
+	for i, item := range venues {
+		hours, ok := item.(map[string]any)["weeklyHours"].([]any)
+		if !ok || len(hours) != 0 {
+			t.Fatalf("venue %d weeklyHours should be [], got %v", i, item)
+		}
+	}
+
+	// 兼容读取不放宽新增要求：缺 weeklyHours 的请求仍是 400。
+	rec = doJSON(t, h, http.MethodPost, "/api/venues", map[string]any{
+		"name": "新场地", "capacity": 5, "timezone": "UTC",
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST without weeklyHours: status = %d, want 400", rec.Code)
+	}
+
+	// 合法新增仍应成功，并保留既有记录、标识与顺序。
+	rec = doJSON(t, h, http.MethodPost, "/api/venues", validPayload())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("valid POST on legacy data: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, h, http.MethodGet, "/api/venues", nil)
+	venues = decodeBody(t, rec)["venues"].([]any)
+	if len(venues) != 3 {
+		t.Fatalf("expected 3 venues, got %d", len(venues))
+	}
+	ids := []string{
+		venues[0].(map[string]any)["id"].(string),
+		venues[1].(map[string]any)["id"].(string),
+		venues[2].(map[string]any)["id"].(string),
+	}
+	if ids[0] != "v-null" || ids[1] != "v-missing" || ids[2] == "" {
+		t.Fatalf("legacy ids/order changed or new id empty: %v", ids)
+	}
+}
+
+// TestValidSavedHoursUnchanged 合法存量记录的读取行为与字段保持原样。
+func TestValidSavedHoursUnchanged(t *testing.T) {
+	s, h := newTestServer(t)
+	want := []Venue{{
+		ID: "v-keep", Name: "游泳馆", Capacity: 80, Timezone: "Asia/Shanghai",
+		WeeklyHours: []WeeklyHour{
+			{Weekday: 1, Start: "22:00", End: "02:00"},
+			{Weekday: 2, Start: "02:00", End: "04:00"}, // 与跨午夜段相邻，合法
+			{Weekday: 7, Start: "10:00", End: "12:00"},
+		},
+	}}
+	writeVenuesFile(t, s, want)
+
+	rec := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid hours: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	venues := decodeBody(t, rec)["venues"].([]any)
+	if len(venues) != 1 {
+		t.Fatalf("expected 1 venue, got %v", venues)
+	}
+	got := venues[0].(map[string]any)
+	if got["id"] != "v-keep" || got["name"] != "游泳馆" ||
+		got["capacity"].(float64) != 80 || got["timezone"] != "Asia/Shanghai" {
+		t.Fatalf("stored fields changed: %v", got)
+	}
+	hours := got["weeklyHours"].([]any)
+	if len(hours) != 3 {
+		t.Fatalf("stored hours changed: %v", hours)
+	}
+	// 合法时段顺序与内容不应被重排或改写。
+	first := hours[0].(map[string]any)
+	if int(first["weekday"].(float64)) != 1 || first["start"] != "22:00" || first["end"] != "02:00" {
+		t.Fatalf("first hours slot changed: %v", first)
+	}
+}
