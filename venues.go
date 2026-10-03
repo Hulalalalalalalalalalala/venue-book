@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -226,16 +228,43 @@ func requireString(payload map[string]any, field string) (string, error) {
 	return str, nil
 }
 
-// jsonInt 取出一个 JSON 数字并要求它是整数；正数范围由调用方决定。
+// jsonNumber 取出一个 JSON 数字的准确数值（有理数），不做 float64 近似。
+// 请求体经 UseNumber 解码后数字是 json.Number（原始字面量）；
+// 直接构造的 payload（如单元测试）仍可能是 float64，按其二进制精确值处理。
+func jsonNumber(value any) (*big.Rat, bool) {
+	switch number := value.(type) {
+	case json.Number:
+		rat, ok := new(big.Rat).SetString(number.String())
+		if !ok {
+			return nil, false
+		}
+		return rat, true
+	case float64:
+		rat := new(big.Rat).SetFloat64(number)
+		if rat == nil { // NaN 或 ±Inf，不是合法 JSON 数字
+			return nil, false
+		}
+		return rat, true
+	}
+	return nil, false
+}
+
+// jsonInt 取出一个 JSON 数字并要求它的准确数值是 int 范围内的整数；
+// 正数范围由调用方决定。带任何小数部分（无论多小）都不算整数。
 func jsonInt(value any) (int, bool) {
-	number, ok := value.(float64)
-	if !ok {
+	rat, ok := jsonNumber(value)
+	if !ok || !rat.IsInt() {
 		return 0, false
 	}
-	if number != float64(int64(number)) {
+	num := rat.Num()
+	if !num.IsInt64() {
 		return 0, false
 	}
-	return int(number), true
+	n := num.Int64()
+	if int64(int(n)) != n { // int 可能窄于 int64
+		return 0, false
+	}
+	return int(n), true
 }
 
 func requirePositiveInt(payload map[string]any, field string) (int, error) {
@@ -243,11 +272,23 @@ func requirePositiveInt(payload map[string]any, field string) (int, error) {
 	if !ok || value == nil {
 		return 0, missingOrWrong(field, "正整数")
 	}
-	number, ok := jsonInt(value)
-	if !ok || number <= 0 {
+	rat, ok := jsonNumber(value)
+	if !ok {
 		return 0, missingOrWrong(field, "正整数")
 	}
-	return number, nil
+	// 按准确数值判断：120、120.0、1.2e2 都是整数 120；
+	// 120.00000000000000001、1e-1 都有小数部分，必须拒绝。
+	if !rat.IsInt() {
+		return 0, badRequest("%s 必须是正整数，不能包含小数部分", field)
+	}
+	num := rat.Num()
+	if num.Sign() <= 0 {
+		return 0, missingOrWrong(field, "正整数")
+	}
+	if !num.IsInt64() || int64(int(num.Int64())) != num.Int64() {
+		return 0, badRequest("%s 超出支持范围：最大为 %d", field, int64(math.MaxInt64))
+	}
+	return int(num.Int64()), nil
 }
 
 func parseWeeklyHours(raw any) ([]WeeklyHour, error) {
