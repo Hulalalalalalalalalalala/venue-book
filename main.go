@@ -151,6 +151,10 @@ func handleCreateVenue(w http.ResponseWriter, r *http.Request, records *store) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var payload map[string]any
 	decoder := json.NewDecoder(r.Body)
+	// 容量等整数字段必须按 JSON 数字的原文逐位判断：UseNumber 让数字以
+	// json.Number（原始文本）保留，避免 float64 舍入把 120.00000000000000001
+	// 变成 120、把 9007199254740993 变成相邻整数。
+	decoder.UseNumber()
 	if err := decoder.Decode(&payload); err != nil {
 		errorJSON(w, http.StatusBadRequest, "请求体不是有效的 JSON 对象："+err.Error())
 		return

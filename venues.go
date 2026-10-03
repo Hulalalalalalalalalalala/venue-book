@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +19,11 @@ import (
 	// 内嵌时区数据库，保证在没有 /usr/share/zoneinfo 的环境中也能校验 IANA 时区。
 	_ "time/tzdata"
 )
+
+// maxVenueCapacity 是容量字段支持的整数上限。容量表示人数，必须能在
+// 请求、保存和响应中逐位准确表示，因此范围限定在本机 int 可容纳的区间内
+// （64 位平台上即 int64 上限）。
+const maxVenueCapacity = int64(^uint(0) >> 1)
 
 // WeeklyHour 表示每周固定的一段开放时间。
 // Weekday 用 1 到 7 表示周一至周日；Start/End 为 HH:mm。
@@ -226,28 +234,176 @@ func requireString(payload map[string]any, field string) (string, error) {
 	return str, nil
 }
 
-// jsonInt 取出一个 JSON 数字并要求它是整数；正数范围由调用方决定。
-func jsonInt(value any) (int, bool) {
-	number, ok := value.(float64)
-	if !ok {
-		return 0, false
+// parseJSONInteger 按 JSON 数字的准确十进制文本判断它是否为整数，并返回其
+// 精确值。value 必须来自开启了 UseNumber 的 JSON 解码（即 json.Number），
+// 这样即使是 9007199254740993 这样超过 float64 安全整数范围、或
+// 120.00000000000000001 这样带极小小数的数字，也不会在转换中被悄悄舍入。
+//
+// 返回值含义：
+//   - isInt=false：不是 JSON 整数（根本不是数字，或带有非零小数部分）；
+//   - isInt=true、inRange=true：z 是精确的整数值，且能放进 int64；
+//   - isInt=true、inRange=false：确实是整数，但超出 int64 可表示范围，
+//     此时 z 为 nil，sign 仍标明它是正数还是负数。
+//
+// 120、120.0、1.2e2 都得到整数 120；120.00000000000000001 和 1e-1 则带
+// 小数部分，判定为非整数。
+func parseJSONInteger(value any) (z *big.Int, sign int, isInt bool, inRange bool) {
+	switch number := value.(type) {
+	case json.Number:
+		return parseIntegerText(string(number))
+	case float64:
+		// 兼容直接在进程内构造 map（如测试）的调用方。HTTP 入口已启用
+		// UseNumber，不会走到这里；此处能看到的只有调用方手中的 float64，
+		// 按其当前值做精确的整数判断即可。
+		if math.IsNaN(number) || math.IsInf(number, 0) || number != math.Trunc(number) {
+			return nil, 0, false, false
+		}
+		sig := 1
+		switch {
+		case number < 0:
+			sig = -1
+		case number == 0:
+			sig = 0
+		}
+		// 用严格的 2^63 边界比较，避免 float64(math.MaxInt64) 进位到 2^63
+		// 后再转 int64 发生溢出回绕。
+		if number < -9223372036854775808.0 || number >= 9223372036854775808.0 {
+			return nil, sig, true, false
+		}
+		n := int64(number)
+		return big.NewInt(n), sig, true, true
+	default:
+		return nil, 0, false, false
 	}
-	if number != float64(int64(number)) {
-		return 0, false
-	}
-	return int(number), true
 }
 
+// parseIntegerText 按 JSON 数字的原始十进制文本做精确解析，逻辑见
+// parseJSONInteger 的说明。
+func parseIntegerText(text string) (z *big.Int, sign int, isInt bool, inRange bool) {
+	mant, exp, ok := decimalNumber(text)
+	if !ok {
+		return nil, 0, false, false
+	}
+	if mant.Sign() == 0 {
+		// 0、0.0、0e10 等都精确等于整数 0。
+		return big.NewInt(0), 0, true, true
+	}
+	// 极大/极小指数下无需真的构造巨大整数：非零尾数乘 10^exp 必然超出
+	// int64；非零数除以足够大的 10 的幂必然留下小数部分。
+	switch {
+	case exp > 100000:
+		return nil, mant.Sign(), true, false
+	case exp < -100000:
+		return nil, mant.Sign(), false, false
+	}
+	z = new(big.Int).Set(mant)
+	if exp >= 0 {
+		z.Mul(z, new(big.Int).Exp(big.NewInt(10), big.NewInt(exp), nil))
+	} else {
+		divisor := new(big.Int).Exp(big.NewInt(10), big.NewInt(-exp), nil)
+		abs := new(big.Int).Set(z)
+		if abs.Sign() < 0 {
+			abs.Neg(abs)
+		}
+		// 不能被 10^(-exp) 整除，说明小数点后存在非零数字，不是整数。
+		if new(big.Int).Mod(abs, divisor).Sign() != 0 {
+			return nil, mant.Sign(), false, false
+		}
+		z.Quo(z, divisor)
+	}
+	if !z.IsInt64() {
+		return nil, z.Sign(), true, false
+	}
+	return z, z.Sign(), true, true
+}
+
+// decimalNumber 把 JSON 数字文本拆成带符号的整数尾数 m 与十进制指数 e，
+// 使 原值 == m * 10^e。输入来自合法 JSON 解码，不接受 Infinity/NaN。
+func decimalNumber(text string) (m *big.Int, e int64, ok bool) {
+	s := text
+	neg := false
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		neg = s[0] == '-'
+		s = s[1:]
+	}
+	if s == "" {
+		return nil, 0, false
+	}
+	rest, expText, hasExp := s, "", false
+	if i := strings.IndexAny(s, "eE"); i >= 0 {
+		rest, expText, hasExp = s[:i], s[i+1:], true
+	}
+	body := rest
+	if i := strings.IndexByte(rest, '.'); i >= 0 {
+		whole, frac := rest[:i], rest[i+1:]
+		if frac == "" {
+			return nil, 0, false // 如 "1."，不是合法 JSON 数字
+		}
+		body = whole + frac
+		e = -int64(len(frac))
+	}
+	if body == "" || !isDigits(body) {
+		return nil, 0, false
+	}
+	if hasExp {
+		exp, err := strconv.ParseInt(expText, 10, 64)
+		if err != nil {
+			return nil, 0, false
+		}
+		e += exp
+	}
+	m, ok = new(big.Int).SetString(body, 10)
+	if !ok {
+		return nil, 0, false
+	}
+	if neg {
+		m.Neg(m)
+	}
+	return m, e, true
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// requirePositiveInt 校验表示人数的容量字段：必须是 JSON 数字、按准确数值
+// 判断为正整数，且落在支持的整数范围内。任何非正整数（零、负数以及带小数
+// 部分的数字）都返回“必须是正整数”；是整数但超出范围则返回“超出支持范围”，
+// 绝不截断或舍入成相邻整数保存。
 func requirePositiveInt(payload map[string]any, field string) (int, error) {
 	value, ok := payload[field]
 	if !ok || value == nil {
 		return 0, missingOrWrong(field, "正整数")
 	}
-	number, ok := jsonInt(value)
-	if !ok || number <= 0 {
+	z, sign, isInt, inRange := parseJSONInteger(value)
+	if !isInt || sign <= 0 {
 		return 0, missingOrWrong(field, "正整数")
 	}
-	return number, nil
+	if !inRange || z.Int64() > maxVenueCapacity {
+		return 0, badRequest("%s 超出支持范围：容量必须是 1 到 %d 的整数", field, maxVenueCapacity)
+	}
+	return int(z.Int64()), nil
+}
+
+// requireWeekday 用与容量相同的精确文本解析星期字段，保证只接受 1 到 7 的
+// 整数（1.5 这类带小数的值不会被舍入后接受）。
+func requireWeekday(value any, i int) (int, error) {
+	z, _, isInt, inRange := parseJSONInteger(value)
+	if !isInt {
+		return 0, badRequest("weeklyHours[%d].weekday 类型错误：应为 1 到 7 的整数", i)
+	}
+	if !inRange || z.Int64() < 1 || z.Int64() > 7 {
+		return 0, badRequest("weeklyHours[%d].weekday 必须为 1 到 7（周一至周日）", i)
+	}
+	return int(z.Int64()), nil
 }
 
 func parseWeeklyHours(raw any) ([]WeeklyHour, error) {
@@ -268,12 +424,9 @@ func parseWeeklyHours(raw any) ([]WeeklyHour, error) {
 		if !ok || rawWeekday == nil {
 			return nil, badRequest("weeklyHours[%d].weekday 类型错误：应为 1 到 7 的整数", i)
 		}
-		weekday, ok := jsonInt(rawWeekday)
-		if !ok {
-			return nil, badRequest("weeklyHours[%d].weekday 类型错误：应为 1 到 7 的整数", i)
-		}
-		if weekday < 1 || weekday > 7 {
-			return nil, badRequest("weeklyHours[%d].weekday 必须为 1 到 7（周一至周日）", i)
+		weekday, err := requireWeekday(rawWeekday, i)
+		if err != nil {
+			return nil, err
 		}
 		start, err := hourField(obj, i, "start")
 		if err != nil {

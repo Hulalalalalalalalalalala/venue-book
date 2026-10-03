@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -638,6 +639,280 @@ func TestLegacyNullWeeklyHoursReadAsEmpty(t *testing.T) {
 	}
 	if ids[0] != "v-null" || ids[1] != "v-missing" || ids[2] == "" {
 		t.Fatalf("legacy ids/order changed or new id empty: %v", ids)
+	}
+}
+
+// ---- 容量精确整数校验 ----
+
+// TestParseJSONIntegerExact 直接验证按 JSON 数字原文做的精确整数判断：
+// 不经过 float64，因此微小的小数部分不会被舍掉，超过 2^53 的整数也不会错位。
+func TestParseJSONIntegerExact(t *testing.T) {
+	want := func(text string, value int64) {
+		t.Helper()
+		wantSign := 0
+		switch {
+		case value > 0:
+			wantSign = 1
+		case value < 0:
+			wantSign = -1
+		}
+		z, sign, isInt, inRange := parseJSONInteger(json.Number(text))
+		if !isInt || !inRange || sign != wantSign || z.Int64() != value {
+			t.Fatalf("%s: want in-range integer %d, got z=%v sign=%d isInt=%v inRange=%v",
+				text, value, z, sign, isInt, inRange)
+		}
+	}
+	wantNotInt := func(text string) {
+		t.Helper()
+		if _, _, isInt, _ := parseJSONInteger(json.Number(text)); isInt {
+			t.Fatalf("%s: must NOT be treated as an integer", text)
+		}
+	}
+	wantOutOfRange := func(text string) {
+		t.Helper()
+		z, _, isInt, inRange := parseJSONInteger(json.Number(text))
+		if !isInt || inRange || z != nil {
+			t.Fatalf("%s: want out-of-range integer (nil z), got z=%v isInt=%v inRange=%v",
+				text, z, isInt, inRange)
+		}
+	}
+
+	// 三种合法写法都表示整数 120。
+	want("120", 120)
+	want("120.0", 120)
+	want("1.2e2", 120)
+	want("1200e-1", 120)
+	want("0.0", 0)
+	want("-3", -3)
+	want("9007199254740993", 9007199254740993) // 2^53+1，float64 无法表示
+	want("9223372036854775807", 9223372036854775807)
+	want("9.007199254740993e15", 9007199254740993)
+
+	// 任何非零小数部分都必须被识别出来，无论它在 float64 中会不会被舍掉。
+	wantNotInt("120.00000000000000001")
+	wantNotInt("0.1")
+	wantNotInt("1e-1")
+	wantNotInt("120.0000000001")
+	wantNotInt("1.23456789012345678")
+	wantNotInt("1e-323") // 极小正数，走快速路径
+
+	// 确实是整数但超出 int64：与“不是整数”区分开。
+	wantOutOfRange("9223372036854775808") // 2^63
+	wantOutOfRange("999999999999999999999999")
+	wantOutOfRange("1e100")
+	wantOutOfRange("1e1000000") // 极大指数，走快速路径
+
+	// 非数字类型（HTTP 路径下 UseNumber 只把数字变成 json.Number）。
+	for _, v := range []any{"120", true, nil, []any{}, map[string]any{}} {
+		if _, _, isInt, _ := parseJSONInteger(v); isInt {
+			t.Fatalf("%v must not be parsed as an integer", v)
+		}
+	}
+
+	// 进程内直接传 float64（测试/其它调用方）的兼容行为。
+	if z, _, isInt, inRange := parseJSONInteger(120.0); !isInt || !inRange || z.Int64() != 120 {
+		t.Fatalf("float64 120 should be accepted, got %v", z)
+	}
+	if _, _, isInt, _ := parseJSONInteger(12.5); isInt {
+		t.Fatalf("float64 12.5 must not be an integer")
+	}
+}
+
+// postRaw 直接发送原始 JSON 文本，确保数字以服务端实际看到的形式到达。
+func postRaw(t *testing.T, h http.Handler, raw string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/venues", strings.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func validBodyWithCapacity(capacityJSON string) string {
+	return `{"name":"音乐厅","capacity":` + capacityJSON +
+		`,"timezone":"Asia/Shanghai","weeklyHours":[]}`
+}
+
+// TestCapacityExactOverHTTP 覆盖需求中的核心场景：通过真实 HTTP JSON 文本
+// 提交容量，验证响应与列表中的数字逐位一致。
+func TestCapacityExactOverHTTP(t *testing.T) {
+	t.Run("tiny fractional part is rejected", func(t *testing.T) {
+		_, h := newTestServer(t)
+		rec := postRaw(t, h, validBodyWithCapacity("120.00000000000000001"))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+		}
+		if msg := decodeBody(t, rec)["error"].(string); !strings.Contains(msg, "正整数") {
+			t.Fatalf("error must say capacity must be a positive integer, got %q", msg)
+		}
+		assertEmptyVenueList(t, h)
+	})
+
+	t.Run("1e-1 is rejected", func(t *testing.T) {
+		_, h := newTestServer(t)
+		rec := postRaw(t, h, validBodyWithCapacity("1e-1"))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", rec.Code)
+		}
+		assertEmptyVenueList(t, h)
+	})
+
+	for _, lit := range []string{"120", "120.0", "1.2e2"} {
+		t.Run("valid integer literal "+lit, func(t *testing.T) {
+			_, h := newTestServer(t)
+			rec := postRaw(t, h, validBodyWithCapacity(lit))
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201, body = %s", rec.Code, rec.Body.String())
+			}
+			if got := decodeBody(t, rec)["venue"].(map[string]any)["capacity"].(float64); got != 120 {
+				t.Fatalf("capacity = %v, want 120", got)
+			}
+			listRec := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+			got := decodeBody(t, listRec)["venues"].([]any)[0].(map[string]any)["capacity"].(float64)
+			if got != 120 {
+				t.Fatalf("listed capacity = %v, want 120", got)
+			}
+		})
+	}
+
+	t.Run("integer beyond float64 safe range is preserved exactly", func(t *testing.T) {
+		s, h := newTestServer(t)
+		const exact = "9007199254740993" // 2^53+1
+		rec := postRaw(t, h, validBodyWithCapacity(exact))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201, body = %s", rec.Code, rec.Body.String())
+		}
+		// 响应文本必须逐位包含该整数，不能是相邻的 9007199254740992。
+		body := rec.Body.String()
+		if !strings.Contains(body, exact) || strings.Contains(body, "9007199254740992") {
+			t.Fatalf("response must carry the exact integer %s: %s", exact, body)
+		}
+		// 用 UseNumber 解析，避免测试端 float64 再次舍入。
+		var decoded struct {
+			Venue struct {
+				Capacity json.Number `json:"capacity"`
+			} `json:"venue"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Venue.Capacity.String() != exact {
+			t.Fatalf("response capacity = %q, want %s", decoded.Venue.Capacity, exact)
+		}
+
+		// 列表中必须是同一个容量。
+		listRec := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+		var listed struct {
+			Venues []struct {
+				Capacity json.Number `json:"capacity"`
+			} `json:"venues"`
+		}
+		if err := json.Unmarshal(listRec.Body.Bytes(), &listed); err != nil {
+			t.Fatal(err)
+		}
+		if len(listed.Venues) != 1 || listed.Venues[0].Capacity.String() != exact {
+			t.Fatalf("listed capacity = %+v, want exactly [%s]", listed.Venues, exact)
+		}
+
+		// 持久化文件里也必须逐位准确。
+		raw, err := os.ReadFile(s.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(raw), exact) {
+			t.Fatalf("stored file must contain exact integer:\n%s", raw)
+		}
+	})
+
+	t.Run("same integer written with exponent notation", func(t *testing.T) {
+		_, h := newTestServer(t)
+		rec := postRaw(t, h, validBodyWithCapacity("9.007199254740993e15"))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201, body = %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "9007199254740993") {
+			t.Fatalf("exponential integer must be stored exactly: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("integer outside supported range is rejected as 400", func(t *testing.T) {
+		s, h := newTestServer(t)
+		for _, lit := range []string{
+			"9223372036854775808",          // 2^63
+			"999999999999999999999999",     // 远超范围
+			"1e100",                        // 指数写法的超大整数
+			"9007199254740993000000000000", // 超过 int64
+		} {
+			rec := postRaw(t, h, validBodyWithCapacity(lit))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("%s: status = %d, want 400, body = %s", lit, rec.Code, rec.Body.String())
+			}
+			if msg := decodeBody(t, rec)["error"].(string); !strings.Contains(msg, "超出支持范围") {
+				t.Fatalf("%s: error must explain out-of-range, got %q", lit, msg)
+			}
+		}
+		assertEmptyVenueList(t, h)
+		data, err := os.ReadFile(s.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimSpace(string(data)) != "[]" {
+			t.Fatalf("no record may be written on range error, got %s", data)
+		}
+	})
+
+	t.Run("zero negative string boolean null and missing are rejected", func(t *testing.T) {
+		cases := map[string]string{
+			"zero":        validBodyWithCapacity("0"),
+			"negative":    validBodyWithCapacity("-5"),
+			"string":      `{"name":"x","capacity":"120","timezone":"UTC","weeklyHours":[]}`,
+			"boolean":     `{"name":"x","capacity":true,"timezone":"UTC","weeklyHours":[]}`,
+			"null":        `{"name":"x","capacity":null,"timezone":"UTC","weeklyHours":[]}`,
+			"missing":     `{"name":"x","timezone":"UTC","weeklyHours":[]}`,
+			"float false": `{"name":"x","capacity":12.5,"timezone":"UTC","weeklyHours":[]}`,
+		}
+		for name, raw := range cases {
+			t.Run(name, func(t *testing.T) {
+				_, h := newTestServer(t)
+				rec := postRaw(t, h, raw)
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+				}
+				assertEmptyVenueList(t, h)
+			})
+		}
+	})
+
+	t.Run("weekday fractional value is still rejected", func(t *testing.T) {
+		_, h := newTestServer(t)
+		raw := `{"name":"x","capacity":10,"timezone":"UTC","weeklyHours":[` +
+			`{"weekday":1.5,"start":"10:00","end":"12:00"}]}`
+		rec := postRaw(t, h, raw)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+		}
+		assertEmptyVenueList(t, h)
+	})
+}
+
+func assertEmptyVenueList(t *testing.T, h http.Handler) {
+	t.Helper()
+	listRec := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+	venues := decodeBody(t, listRec)["venues"].([]any)
+	if len(venues) != 0 {
+		t.Fatalf("rejected request must not leave any venue, got %v", venues)
+	}
+}
+
+// TestExactBigIntSanity 防止 big.Int 期望值本身写错。
+func TestExactBigIntSanity(t *testing.T) {
+	z, _, isInt, inRange := parseJSONInteger(json.Number("9007199254740993"))
+	if !isInt || !inRange {
+		t.Fatalf("expected in-range integer")
+	}
+	want, _ := new(big.Int).SetString("9007199254740993", 10)
+	if z.Cmp(want) != 0 {
+		t.Fatalf("got %s, want %s", z, want)
 	}
 }
 
