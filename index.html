@@ -125,15 +125,31 @@
     remove.type = "button";
     remove.className = "danger";
     remove.textContent = "删除";
-    remove.addEventListener("click", function () { row.remove(); });
+    remove.addEventListener("click", function () { row.remove(); markFormDirty(); });
     row.appendChild(weekday);
     row.appendChild(start);
     row.appendChild(dash);
     row.appendChild(end);
     row.appendChild(remove);
     hoursRows.appendChild(row);
+    markFormDirty();
   }
   document.getElementById("add-hour").addEventListener("click", addHourRow);
+
+  // 保存请求发出后到响应返回前，表单仍然允许编辑。用“脏标记”区分响应返回
+  // 时表单是否已被用户动过：只有请求在途期间一次都没改过，成功后才执行既
+  // 有的清空；一旦改过名称、容量、时区或增删改过时段行（哪怕后来又改回原
+  // 值），成功响应只刷新列表，必须完整保留当前整份表单。
+  var formDirty = false;
+  var submitSequence = 0;
+  function markFormDirty() { formDirty = true; }
+  ["name", "capacity", "timezone"].forEach(function (id) {
+    document.getElementById(id).addEventListener("input", markFormDirty);
+  });
+  // 时段行是动态添加的，输入与星期选择在容器上统一捕获；新增/删除行在
+  // addHourRow 内单独标记。
+  hoursRows.addEventListener("input", markFormDirty);
+  hoursRows.addEventListener("change", markFormDirty);
 
   function collectHours() {
     var rows = hoursRows.querySelectorAll(".hour-row");
@@ -296,6 +312,12 @@
     var collected = collectHours();
     if (collected.error) { showError("保存失败：" + collected.error); return; }
 
+    // 本次提交保存的始终是点击保存那一刻的内容：名称、容量、时区与时段在
+    // 上方已经取定，请求体直接使用这些快照值。随后无论用户怎么改，都不会
+    // 影响已经发出的请求，也不能把后来的输入当成已保存数据。
+    var thisSubmit = ++submitSequence;
+    formDirty = false;
+
     // 失败时不重置表单，保留全部填写内容。
     fetch("/api/venues", {
       method: "POST",
@@ -308,16 +330,33 @@
         return { ok: res.ok, status: res.status, body: body };
       });
     }).then(function (result) {
+      var isLatest = thisSubmit === submitSequence;
       if (!result.ok) {
+        // 已有更新的一次保存发出时，旧响应不再覆盖界面状态；最新一次保存
+        // 的成败由它自己的响应负责展示。
+        if (!isLatest) return;
         var reason = result.body && result.body.error ? result.body.error : "HTTP " + result.status;
         showError("保存失败：" + reason);
         return;
       }
-      form.reset();
-      hoursRows.innerHTML = "";
-      clearError();
+      // 只有最新一次保存成功、且请求在途期间表单一次都没被动过，才沿用既
+      // 有行为：清空字段、移除时段行、消除错误提示。只要用户在等待期间改
+      // 过任何字段或时段行（哪怕又改回提交时的值），或之后又发起了新的保
+      // 存，就完整保留当前整份表单及其顺序；后来填成空值或非法内容也同样
+      // 保留，不影响这次合法提交的成功展示。
+      if (isLatest && !formDirty) {
+        form.reset();
+        hoursRows.innerHTML = "";
+        clearError();
+      }
+      // 无论新旧，成功保存的记录都来自服务端数据，刷新列表让该次提交的
+      // 记录出现，不混入用户尚未提交的改动。
       return loadVenues();
     }).catch(function (err) {
+      // 已有更新的保存发出时，忽略旧请求的连接失败提示。
+      if (thisSubmit !== submitSequence) return;
+      // 连接失败：展示本次保存的失败原因并保留当前填写内容，不恢复旧值。
+      // loadVenues 内部已自行处理列表渲染失败，不会走到这里。
       showError("保存失败：无法连接服务（" + err.message + "），请稍后重试。");
     });
   });
