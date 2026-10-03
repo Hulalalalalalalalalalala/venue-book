@@ -226,6 +226,112 @@ function createNetworkLog(cdp) {
   };
 }
 
+// ---- POST 挂起闸门（Fetch 域拦截）----
+
+// createPostGate 用 CDP 的 Fetch 域把发往 /api/venues 的 POST 暂停在“请求
+// 已经发出、响应尚未返回”的阶段，真实复现“点击保存后、结果返回前继续编辑
+// 表单”的等待窗口：pause() 之后遇到的下一个场地 POST 会被挂起，测试先在
+// 页面里完成编辑，再决定放行到真实服务端（pass）或直接合成响应（fulfill，
+// 例如 400），响应内容与到达时机完全由测试掌握。列表 GET 等其余请求一律
+// 立即放行，不改变页面与服务端的既有行为。
+function createPostGate(cdp) {
+  // held: id -> { id, requestId, url, body, done }
+  const held = new Map();
+  let seq = 0;
+  let paused = false;
+  let waiters = [];
+
+  cdp.on((method, params) => {
+    if (method !== "Fetch.requestPaused") return;
+    // 监听器内的异步失败（例如请求已失效）绝不能冒泡成 unhandledRejection，
+    // 统一吞掉：挂起/放行失败只会让对应场景的断言失败。
+    (async () => {
+      const isVenuePost = params.request && params.request.method === "POST" &&
+        params.request.url.includes("/api/venues");
+      if (!paused || !isVenuePost) {
+        try {
+          await cdp.send("Fetch.continueRequest", { requestId: params.requestId });
+        } catch { /* 请求可能已失效，忽略 */ }
+        return;
+      }
+      // 挂起时立即取回请求体原文：此时尚未放行，内容必然是点击保存那一刻的
+      // 快照，之后页面怎么改都影响不到它。
+      let body = null;
+      try {
+        const out = await cdp.send("Fetch.getRequestBody", { requestId: params.requestId });
+        body = out.base64Encoded ? Buffer.from(out.body, "base64").toString("utf8") : out.body;
+      } catch {
+        body = params.request.postData || null;
+      }
+      const id = ++seq;
+      held.set(id, { id, requestId: params.requestId, url: params.request.url, body, done: false });
+      const ws = waiters;
+      waiters = [];
+      for (const w of ws) w(id);
+    })().catch(() => { /* 竞态失败交给场景断言处理 */ });
+  });
+
+  return {
+    async enable() {
+      await cdp.send("Fetch.enable", {
+        patterns: [{ urlPattern: "*api/venues*", requestStage: "Request" }],
+      });
+    },
+    pause() { paused = true; },
+    resume() { paused = false; },
+    nextHold(timeout = 8000) {
+      for (const rec of held.values()) {
+        if (!rec.done) return Promise.resolve(rec.id);
+      }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("等待 POST /api/venues 被挂起超时")), timeout);
+        waiters.push((id) => { clearTimeout(timer); resolve(id); });
+      });
+    },
+    bodyOf(id) {
+      const rec = held.get(id);
+      return rec ? rec.body : null;
+    },
+    // pass 放行到真实服务端，由真实处理链给出 201/400。
+    async pass(id) {
+      const rec = held.get(id);
+      if (!rec || rec.done) return;
+      rec.done = true;
+      await cdp.send("Fetch.continueRequest", { requestId: rec.requestId });
+    },
+    // fulfill 不接触真实服务端，直接合成一个响应，保证“失败提交”不可能在
+    // 服务端落地。
+    async fulfill(id, status, payload) {
+      const rec = held.get(id);
+      if (!rec || rec.done) return;
+      rec.done = true;
+      const raw = JSON.stringify(payload);
+      await cdp.send("Fetch.fulfillRequest", {
+        requestId: rec.requestId,
+        responseCode: status,
+        responseHeaders: [
+          { name: "Content-Type", value: "application/json; charset=utf-8" },
+          { name: "Content-Length", value: String(Buffer.byteLength(raw)) },
+        ],
+        body: Buffer.from(raw, "utf8").toString("base64"),
+      });
+    },
+    // continueAll 放行所有仍挂着的请求：场景中断时自愈，避免遗留 fetch 永久
+    // 挂起影响后续场景。
+    async continueAll() {
+      for (const rec of held.values()) {
+        if (!rec.done) {
+          rec.done = true;
+          try {
+            await cdp.send("Fetch.continueRequest", { requestId: rec.requestId });
+          } catch { /* ignore */ }
+        }
+      }
+    },
+  };
+}
+
 // ---- 注入页面的测试驱动 ----
 
 // fill：按真实用户方式给字段赋 value（原型 setter + input/change），
@@ -302,6 +408,79 @@ const PAGE_CHANGE_LAST_START = `function (value) {
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
   return true;
+}`;
+
+// setFields：只修改给出的字段（name/capacity/timezone 任意子集），其余字段
+// 原封不动，用于在保存请求在途期间做局部编辑。值按真实输入方式注入并派发
+// input/change，确保页面的脏标记等监听真实触发。
+const PAGE_SET_FIELDS = `function (data) {
+  function setValue(el, value) {
+    var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    setter.call(el, String(value));
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  if (data.name !== undefined && data.name !== null) {
+    setValue(document.getElementById("name"), data.name);
+  }
+  if (data.capacity !== undefined && data.capacity !== null) {
+    setValue(document.getElementById("capacity"), data.capacity);
+  }
+  if (data.timezone !== undefined && data.timezone !== null) {
+    setValue(document.getElementById("timezone"), data.timezone);
+  }
+  return true;
+}`;
+
+// hoursEdit：在不动其它行的前提下修改开放时段行集合：
+//   {op:"setRow", index, weekday?, start?, end?}  修改指定行（null 表示清空该时间）
+//   {op:"addRow", weekday, start, end}            点“添加开放时段”后填值
+//   {op:"removeRow", index}                       点指定行的“删除”
+// 与真实用户操作一致，新增/删除会触发页面在这些按钮上挂的脏标记。
+const PAGE_HOURS_EDIT = `function (action) {
+  function setValue(el, value) {
+    var proto = el.tagName === "SELECT" ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    var setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+    setter.call(el, String(value));
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  function rows() { return document.querySelectorAll("#hours-rows .hour-row"); }
+  if (action.op === "removeRow") {
+    var all = rows();
+    if (!all[action.index]) return false;
+    all[action.index].querySelector("button.danger").click();
+    return true;
+  }
+  if (action.op === "addRow") {
+    document.getElementById("add-hour").click();
+    var added = rows()[rows().length - 1];
+    if (action.weekday !== undefined && action.weekday !== null) {
+      setValue(added.querySelector(".hour-weekday"), action.weekday);
+    }
+    if (action.start !== undefined && action.start !== null) {
+      setValue(added.querySelector(".hour-start"), action.start);
+    }
+    if (action.end !== undefined && action.end !== null) {
+      setValue(added.querySelector(".hour-end"), action.end);
+    }
+    return true;
+  }
+  if (action.op === "setRow") {
+    var row = rows()[action.index];
+    if (!row) return false;
+    if (action.weekday !== undefined && action.weekday !== null) {
+      setValue(row.querySelector(".hour-weekday"), action.weekday);
+    }
+    if (action.start !== undefined) {
+      setValue(row.querySelector(".hour-start"), action.start === null ? "" : action.start);
+    }
+    if (action.end !== undefined) {
+      setValue(row.querySelector(".hour-end"), action.end === null ? "" : action.end);
+    }
+    return true;
+  }
+  return false;
 }`;
 
 // state：读取错误提示、表单当前值与场地卡片文本（textContent 即页面
@@ -396,6 +575,11 @@ async function main() {
 
     const net = createNetworkLog(cdp);
 
+    // POST 挂起闸门：默认不拦截（请求一律立即放行），仅在“等待期编辑”场景
+    // 中临时 pause，把下一个场地 POST 挂在响应返回之前。
+    const gate = createPostGate(cdp);
+    await gate.enable();
+
     const navigate = async () => {
       await cdp.send("Page.navigate", { url: baseURL + "/" });
       // 等待初始列表渲染完成（“正在加载…”消失）。
@@ -410,6 +594,8 @@ async function main() {
     const state = () => cdp.eval(`(${PAGE_STATE})()`);
     const fill = (data) => cdp.evalFn(PAGE_FILL, data);
     const fillPartial = (data) => cdp.evalFn(PAGE_FILL_PARTIAL, data);
+    const setFields = (data) => cdp.evalFn(PAGE_SET_FIELDS, data);
+    const hoursEdit = (action) => cdp.evalFn(PAGE_HOURS_EDIT, action);
     const removeAllHours = () => cdp.eval(`(${PAGE_REMOVE_ALL_HOURS})()`);
     const changeLastHourStart = (value) => cdp.evalFn(PAGE_CHANGE_LAST_START, value);
     const submit = () => cdp.eval(`(${PAGE_SUBMIT})()`);
@@ -436,6 +622,99 @@ async function main() {
     const rawCapacityToken = (raw) => {
       const m = raw.match(/"capacity"\s*:\s*([^,}\s]+)/);
       return m ? m[1] : null;
+    };
+
+    // ---- “等待期间继续编辑”场景共用辅助 ----
+
+    const WEEKDAY_CN = { 1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六", 7: "周日" };
+    const toMin = (hhmm) => {
+      const p = String(hhmm).split(":");
+      return Number(p[0]) * 60 + Number(p[1]);
+    };
+    // expectedChips 按页面既有规则（先星期、再按开始时间）计算卡片时段标签，
+    // 跨午夜（结束早于开始）标注“次日 HH:mm”。
+    const expectedChips = (hours) => hours.slice()
+      .sort((a, b) => (a.weekday - b.weekday) || (toMin(a.start) - toMin(b.start)))
+      .map((h) => WEEKDAY_CN[h.weekday] + " " + h.start + " – " +
+        (toMin(h.end) < toMin(h.start) ? "次日 " + h.end : h.end));
+
+    // submitHeld：点击保存并让该 POST 停在“请求已发出、响应未返回”。拿到的
+    // body 是点击那一刻的整份内容；调用方随后在页面里编辑，再决定 pass/
+    // fulfill。gate 在挂住请求后立即恢复放行，后续请求（含成功后的列表
+    // GET）不受影响，被挂住的这一个仍需显式放行。
+    const submitHeld = async () => {
+      gate.pause();
+      await submit();
+      const id = await gate.nextHold();
+      gate.resume();
+      const body = gate.bodyOf(id);
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch { /* 由场景断言 */ }
+      return { id, body, parsed };
+    };
+
+    // waitLastPostStatus 等待最近一个 POST 的响应状态出现在 Network 记录里，
+    // 再等一拍让页面完成表单处理与列表渲染，返回该条 POST 记录。
+    const waitLastPostStatus = async (status) => {
+      const rec = await poll(async () => {
+        const posts = net.venuePosts();
+        const last = posts[posts.length - 1];
+        return last && last.status === status ? last : null;
+      }, { timeout: 8000, label: "挂起 POST 响应 status=" + status });
+      await sleep(350);
+      return rec;
+    };
+
+    // formIs 逐字段比较当前表单（时段按 DOM 中的当前顺序）。
+    const formIs = (form, want) =>
+      form.name === want.name &&
+      form.capacity === String(want.capacity) &&
+      form.timezone === want.timezone &&
+      form.hours.length === want.hours.length &&
+      want.hours.every((h, i) => {
+        const g = form.hours[i];
+        return !!g && g.weekday === String(h.weekday) && g.start === h.start && g.end === h.end;
+      });
+
+    // assertRequestSnapshot 断言已发出的请求体就是点击保存那一刻的快照。
+    const assertRequestSnapshot = (S, label, held, want) => {
+      check(S, label + "请求体是合法 JSON", !!held.parsed, held.body);
+      if (!held.parsed) return;
+      check(S, label + "请求名称为点击时的值", held.parsed.name === want.name,
+        `got=${held.parsed.name}`);
+      check(S, label + "请求容量为点击时的值", held.parsed.capacity === Number(want.capacity),
+        `got=${held.parsed.capacity}`);
+      check(S, label + "请求时区为点击时的值", held.parsed.timezone === want.timezone,
+        `got=${held.parsed.timezone}`);
+      const sameRows = Array.isArray(held.parsed.weeklyHours) &&
+        held.parsed.weeklyHours.length === want.hours.length &&
+        want.hours.every((h, i) => {
+          const g = held.parsed.weeklyHours[i];
+          return !!g && g.weekday === h.weekday && g.start === h.start && g.end === h.end;
+        });
+      check(S, label + "请求各时段按点击时的内容与顺序", sameRows,
+        JSON.stringify(held.parsed.weeklyHours));
+    };
+
+    // assertSavedCard 断言列表卡片严格等于服务端真正保存的快照：名称、容量、
+    // 时区、排序后的时段标签一致，且不混入任何等待期里出现的未提交文本。
+    const assertSavedCard = (S, label, cards, want, absentTexts) => {
+      const card = findCard(cards, want.name);
+      check(S, label + "列表新增的是已提交场地卡片", !!card,
+        JSON.stringify(cards.map((c) => c.name)));
+      if (!card) return;
+      check(S, label + "卡片容量为已提交容量", capacityOnCard(card) === String(want.capacity),
+        card.text);
+      check(S, label + "卡片时区为已提交时区", card.tz === "时区：" + want.timezone, card.tz);
+      const wantChips = expectedChips(want.hours);
+      check(S, label + "卡片只显示已保存时段（排序/次日标注照旧）",
+        card.chips.length === wantChips.length &&
+          wantChips.every((t, i) => card.chips[i] === t),
+        JSON.stringify({ got: card.chips, want: wantChips }));
+      (absentTexts || []).forEach((txt) => {
+        check(S, label + "卡片不混入未提交内容「" + txt + "」", card.text.indexOf(txt) === -1,
+          card.text);
+      });
     };
 
     // ---------- 场景 1：2^53+1 大整数完整往返 ----------
@@ -954,6 +1233,356 @@ async function main() {
           !!card2 && card2.noHours && card2.chips.length === 0,
           card2 ? card2.text : null);
       } catch (e) {
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ===== “点击保存后、结果返回前继续编辑”回归场景 =====
+    //
+    // 一次保存以点击那一刻的整份内容为准；等待期间用户可以继续修改名称、
+    // 容量、时区与每周开放时间。成功返回时：列表新增的是“已提交”的那份
+    // （绝不混入后来填写的内容），而当前表单必须完整保留用户正在填写的整
+    // 份内容（不恢复旧值、不只留变化字段、不清空未提交内容）。
+
+    // ---------- 场景 10：等待期改名称与容量，成功后两者互不串扰 ----------
+    {
+      const S = "等待期改名称容量";
+      const submitted = { name: "排练室", capacity: "120", timezone: "Asia/Shanghai", hours: [] };
+      const draft = { name: "会议室", capacity: "80", timezone: "Asia/Shanghai", hours: [] };
+      try {
+        const beforeNames = (await state()).cards.map((c) => c.name);
+        await fill(submitted);
+        const held = await submitHeld();
+        // 响应未返回时修改名称与容量。
+        await setFields({ name: draft.name, capacity: draft.capacity });
+
+        check(S, "等待期间已发请求携带的仍是点击时快照（排练室/120）",
+          !!held.parsed && held.parsed.name === "排练室" && held.parsed.capacity === 120,
+          held.body);
+        let pending = await state();
+        check(S, "响应返回前表单已显示新填写内容（会议室/80）",
+          pending.form.name === "会议室" && pending.form.capacity === "80",
+          JSON.stringify(pending.form));
+        check(S, "响应返回前列表尚未新增场地",
+          pending.cards.map((c) => c.name).length === beforeNames.length,
+          JSON.stringify(pending.cards.map((c) => c.name)));
+
+        await gate.pass(held.id);
+        const post = await waitLastPostStatus(201);
+        check(S, "已提交的合法保存返回 201", !!post, "");
+        const after = await state();
+        check(S, "成功后无错误提示", after.error === null, after.error);
+        assertSavedCard(S, "成功后", after.cards, submitted, ["会议室", "80"]);
+        check(S, "列表只多出这一条已提交记录",
+          after.cards.length === beforeNames.length + 1 &&
+            after.cards.map((c) => c.name).indexOf("会议室") === -1,
+          JSON.stringify(after.cards.map((c) => c.name)));
+        check(S, "当前表单完整保留会议室/80（不恢复排练室/120、不清空）",
+          formIs(after.form, draft), JSON.stringify(after.form));
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 11：等待期改时区，卡片显示已提交时区、表单留新值 ----------
+    {
+      const S = "等待期改时区";
+      const submitted = { name: "时区提交馆", capacity: "30", timezone: "UTC", hours: [] };
+      const draft = { name: "时区提交馆", capacity: "30", timezone: "Asia/Tokyo", hours: [] };
+      try {
+        await fill(submitted);
+        const held = await submitHeld();
+        await setFields({ timezone: draft.timezone });
+        assertRequestSnapshot(S, "", held, submitted);
+        await gate.pass(held.id);
+        await waitLastPostStatus(201);
+        const after = await state();
+        assertSavedCard(S, "", after.cards, submitted, ["Asia/Tokyo"]);
+        check(S, "表单时区保留后来填的 Asia/Tokyo", after.form.timezone === "Asia/Tokyo",
+          after.form.timezone);
+        check(S, "未改动的名称/容量也原样保留（不只保留变化字段）",
+          after.form.name === submitted.name && after.form.capacity === "30",
+          JSON.stringify(after.form));
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 12：等待期改某行星期/起止时间、加行、删行，顺序与内容保留 ----------
+    {
+      const S = "等待期增删改开放时段";
+      const name = "时段编辑馆";
+      const submitted = {
+        name, capacity: "200", timezone: "Asia/Shanghai",
+        hours: [
+          { weekday: 2, start: "09:00", end: "12:00" },
+          { weekday: 4, start: "14:00", end: "18:00" },
+          { weekday: 6, start: "10:00", end: "11:00" },
+        ],
+      };
+      try {
+        await fill(submitted);
+        const held = await submitHeld();
+        assertRequestSnapshot(S, "", held, submitted);
+
+        // 等待期间：改第一行星期与起止；删第二行；末尾新增一行。
+        await hoursEdit({ op: "setRow", index: 0, weekday: 3, start: "08:30", end: "09:30" });
+        await hoursEdit({ op: "removeRow", index: 1 });
+        await hoursEdit({ op: "addRow", weekday: 5, start: "19:00", end: "21:00" });
+
+        // 当前剩余各行（按 DOM 顺序）：改后的原首行、原第三行、新增行。
+        const draft = {
+          name, capacity: "200", timezone: "Asia/Shanghai",
+          hours: [
+            { weekday: 3, start: "08:30", end: "09:30" },
+            { weekday: 6, start: "10:00", end: "11:00" },
+            { weekday: 5, start: "19:00", end: "21:00" },
+          ],
+        };
+        const mid = await state();
+        check(S, "响应返回前时段行已是当前编辑结果与顺序", formIs(mid.form, draft),
+          JSON.stringify(mid.form.hours));
+
+        await gate.pass(held.id);
+        await waitLastPostStatus(201);
+        const after = await state();
+        // 卡片只按已提交的三行显示（按星期/开始时间排序）：
+        // 周二 09:00、周四 14:00、周六 10:00。
+        assertSavedCard(S, "", after.cards, submitted,
+          ["周三", "08:30", "19:00", "周五"]);
+        const card = findCard(after.cards, name);
+        check(S, "卡片时段排序为周二/周四/周六（已保存内容）",
+          !!card && card.chips.length === 3 &&
+            card.chips[0].indexOf("周二 09:00") === 0 &&
+            card.chips[1].indexOf("周四 14:00") === 0 &&
+            card.chips[2].indexOf("周六 10:00") === 0,
+          card ? JSON.stringify(card.chips) : null);
+        check(S, "成功后当前表单保留剩余各行的内容与填写顺序",
+          formIs(after.form, draft), JSON.stringify(after.form.hours));
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 12b：等待期只改已有行的星期与起止（不增不删） ----------
+    // 与场景 12 分开：加行/删除按钮本身也会标记脏表单，这里专门保证“在已有
+    // 行上改星期或时间”这一条监听链路独立有效——不能因为没点增删按钮就把
+    // 成功响应当作无编辑而清空。
+    {
+      const S = "等待期只改已有时段行";
+      const name = "行内编辑馆";
+      const submitted = {
+        name, capacity: "90", timezone: "UTC",
+        hours: [
+          { weekday: 1, start: "09:00", end: "12:00" },
+          { weekday: 3, start: "13:00", end: "15:00" },
+        ],
+      };
+      try {
+        await fill(submitted);
+        const held = await submitHeld();
+        assertRequestSnapshot(S, "", held, submitted);
+        // 只在两行原有控件上修改：第一行改星期，第二行改起止时间。
+        await hoursEdit({ op: "setRow", index: 0, weekday: 2 });
+        await hoursEdit({ op: "setRow", index: 1, start: "16:00", end: "17:30" });
+        const draft = {
+          name, capacity: "90", timezone: "UTC",
+          hours: [
+            { weekday: 2, start: "09:00", end: "12:00" },
+            { weekday: 3, start: "16:00", end: "17:30" },
+          ],
+        };
+
+        await gate.pass(held.id);
+        await waitLastPostStatus(201);
+        const after = await state();
+        assertSavedCard(S, "", after.cards, submitted, ["周二", "16:00", "17:30"]);
+        const card = findCard(after.cards, name);
+        check(S, "卡片仍显示已保存的周一/周三两行",
+          !!card && card.chips.length === 2 &&
+            card.chips[0].indexOf("周一 09:00") === 0 &&
+            card.chips[1].indexOf("周三 13:00") === 0,
+          card ? JSON.stringify(card.chips) : null);
+        check(S, "行内修改后表单两行当前值完整保留、行数不变",
+          formIs(after.form, draft), JSON.stringify(after.form.hours));
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 13：等待期先改再改回提交值，成功后仍保留整份表单 ----------
+    {
+      const S = "等待期改回原值仍保留";
+      const submitted = {
+        name: "改回原值馆", capacity: "45", timezone: "UTC",
+        hours: [{ weekday: 1, start: "09:00", end: "17:00" }],
+      };
+      try {
+        await fill(submitted);
+        const held = await submitHeld();
+        // 动过以后又改回与提交完全相同的值；按要求仍算“等待期间发生过编辑”。
+        await setFields({ name: "临时新名字", capacity: "99" });
+        await hoursEdit({ op: "setRow", index: 0, weekday: 7, start: "06:00", end: "08:00" });
+        await setFields({ name: submitted.name, capacity: submitted.capacity });
+        await hoursEdit({ op: "setRow", index: 0, weekday: 1, start: "09:00", end: "17:00" });
+
+        await gate.pass(held.id);
+        await waitLastPostStatus(201);
+        const after = await state();
+        assertSavedCard(S, "", after.cards, submitted, []);
+        check(S, "即使值已改回提交时的样子，表单仍整份保留、不清空",
+          formIs(after.form, submitted), JSON.stringify(after.form));
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 14：等待期把内容改空/改非法/留半截时段，合法提交照成功、表单原样留 ----------
+    {
+      const S = "等待期改成非法内容";
+      const submitted = {
+        name: "合法已提交馆", capacity: "120", timezone: "Asia/Shanghai",
+        hours: [
+          { weekday: 1, start: "09:00", end: "12:00" },
+          { weekday: 3, start: "13:00", end: "15:00" },
+        ],
+      };
+      try {
+        const beforeNames = (await state()).cards.map((c) => c.name);
+        await fill(submitted);
+        const held = await submitHeld();
+        assertRequestSnapshot(S, "", held, submitted);
+
+        // 名称清空、容量改成浏览器 number 输入仍会保留的非法文本 12.5、
+        // 时区清空、第一行时段只留开始时间（半截）。
+        await setFields({ name: "", capacity: "12.5", timezone: "" });
+        await hoursEdit({ op: "setRow", index: 0, end: null });
+
+        await gate.pass(held.id);
+        await waitLastPostStatus(201);
+        const after = await state();
+        check(S, "已发出的合法保存仍然成功、无错误提示", after.error === null, after.error);
+        assertSavedCard(S, "", after.cards, submitted, ["12.5"]);
+        check(S, "列表只新增已提交的合法场地",
+          after.cards.length === beforeNames.length + 1 &&
+            after.cards.map((c) => c.name).indexOf(submitted.name) >= 0,
+          JSON.stringify(after.cards.map((c) => c.name)));
+        // 后来填成的空值/非法/半截内容原样留下，不借这次成功被校验或清掉。
+        check(S, "表单名称保持清空", after.form.name === "", JSON.stringify(after.form.name));
+        check(S, "表单容量保留非法值 12.5（下次保存才校验）",
+          after.form.capacity === "12.5", after.form.capacity);
+        check(S, "表单时区保持清空", after.form.timezone === "", after.form.timezone);
+        const h = after.form.hours;
+        check(S, "半截时段与另一行均原样保留",
+          h.length === 2 &&
+            h[0].weekday === "1" && h[0].start === "09:00" && h[0].end === "" &&
+            h[1].weekday === "3" && h[1].start === "13:00" && h[1].end === "15:00",
+          JSON.stringify(h));
+
+        // 这些当前内容只有在用户“下一次主动保存”时才接受校验：再次点击保存
+        // 应在前端被拦截（名称为空），不发请求，并把当前填写继续留在表单里。
+        const postsBefore = net.snapshot().filter((r) => r.method === "POST").length;
+        await submit();
+        await sleep(350);
+        const postsSent = net.snapshot().filter((r) => r.method === "POST").length - postsBefore;
+        const retried = await state();
+        check(S, "下一次主动保存被前端拦截、不发请求", postsSent === 0, `POST 数量 ${postsSent}`);
+        check(S, "拦截时提示名称不能为空",
+          retried.error && retried.error.indexOf("名称不能为空") >= 0, retried.error);
+        check(S, "被拦截后非法填写仍然保留",
+          retried.form.name === "" && retried.form.capacity === "12.5" &&
+            retried.form.hours.length === 2 && retried.form.hours[0].end === "",
+          JSON.stringify(retried.form));
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 15：等待期编辑后保存失败——显示原因、保留当前内容、不新增卡片 ----------
+    {
+      const S = "等待期编辑后保存失败";
+      const submitted = {
+        name: "失败提交馆", capacity: "50", timezone: "UTC",
+        hours: [{ weekday: 2, start: "10:00", end: "12:00" }],
+      };
+      const draft = {
+        name: "失败后正在填写", capacity: "70", timezone: "Asia/Shanghai",
+        hours: [
+          { weekday: 5, start: "18:00", end: "20:00" },
+          { weekday: 7, start: "09:00", end: "10:30" },
+        ],
+      };
+      try {
+        const beforeNames = (await state()).cards.map((c) => c.name);
+        await fill(submitted);
+        const held = await submitHeld();
+        assertRequestSnapshot(S, "", held, submitted);
+        await setFields({ name: draft.name, capacity: draft.capacity, timezone: draft.timezone });
+        await hoursEdit({ op: "setRow", index: 0, weekday: 5, start: "18:00", end: "20:00" });
+        await hoursEdit({ op: "addRow", weekday: 7, start: "09:00", end: "10:30" });
+
+        // 直接合成 400：该“保存”没有接触真实服务端，不可能落地成新场地。
+        const reason = "模拟服务端拒绝：开放时段存在相交";
+        await gate.fulfill(held.id, 400, { error: reason });
+        await waitLastPostStatus(400);
+        const after = await state();
+        check(S, "失败时显示失败原因",
+          !!after.error && after.error.indexOf(reason) >= 0, after.error);
+        const afterNames = after.cards.map((c) => c.name);
+        check(S, "失败提交不显示为新场地（已提交名与新填写名都不出现）",
+          afterNames.length === beforeNames.length &&
+            afterNames.every((n) => beforeNames.indexOf(n) >= 0) &&
+            afterNames.indexOf(submitted.name) === -1,
+          JSON.stringify({ before: beforeNames, after: afterNames }));
+        check(S, "失败不撤销等待期间的编辑：整份当前表单保留",
+          formIs(after.form, draft), JSON.stringify(after.form));
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 16：等待期间完全没有编辑：成功后整份表单清空（既有行为） ----------
+    {
+      const S = "等待期无编辑则清空";
+      const submitted = {
+        name: "无编辑清空馆", capacity: "60", timezone: "Europe/Paris",
+        hours: [
+          { weekday: 1, start: "09:00", end: "12:00" },
+          { weekday: 7, start: "22:00", end: "02:00" },
+        ],
+      };
+      const empty = { name: "", capacity: "", timezone: "", hours: [] };
+      try {
+        await fill(submitted);
+        const held = await submitHeld();
+        assertRequestSnapshot(S, "", held, submitted);
+        // 刻意不做任何编辑，直接放行。
+        await gate.pass(held.id);
+        await waitLastPostStatus(201);
+        const after = await state();
+        check(S, "成功后无错误提示", after.error === null, after.error);
+        assertSavedCard(S, "", after.cards, submitted, []);
+        const card = findCard(after.cards, submitted.name);
+        check(S, "卡片仍按既有规则排序并标注跨午夜次日",
+          !!card && card.chips.length === 2 &&
+            card.chips[0].indexOf("周一 09:00") === 0 &&
+            /周日 22:00\s*[–-]\s*次日\s*02:00/.test(card.chips[1]),
+          card ? JSON.stringify(card.chips) : null);
+        check(S, "名称/容量/时区全部清空",
+          after.form.name === "" && after.form.capacity === "" && after.form.timezone === "",
+          JSON.stringify(after.form));
+        check(S, "时段行全部移除", after.form.hours.length === 0,
+          JSON.stringify(after.form.hours));
+        check(S, "空表单与空时段行集合一致", formIs(after.form, empty), JSON.stringify(after.form));
+      } catch (e) {
+        await gate.continueAll();
         bad(S, "场景执行中断: " + e.message, e.stack);
       }
     }
