@@ -4,6 +4,8 @@ use std::process::ExitCode;
 
 const VERSION: &str = "0.1.0";
 
+const USAGE: &str = "Usage: roottrace --version | roottrace root <file> | roottrace prove <file> <record-index>";
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.as_slice() {
@@ -21,16 +23,128 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        [cmd, path, index] if cmd == "prove" => {
+            // A malformed index is a usage error even if the file cannot be
+            // read, so parse it before touching the file.
+            let Some(leaf_index) = parse_record_index(index) else {
+                eprintln!("{USAGE}");
+                eprintln!("error: record index must be a decimal non-negative integer of ASCII digits, at most 2^64 - 1");
+                return ExitCode::from(2);
+            };
+            match membership_proof_of_file(path, leaf_index) {
+                Ok(proof) => {
+                    print!("{}", render_proof(&proof));
+                    ExitCode::SUCCESS
+                }
+                Err(ProveError::Read(reason)) => {
+                    eprintln!("roottrace: {reason}");
+                    ExitCode::FAILURE
+                }
+                Err(ProveError::NoPosition(reason)) => {
+                    eprintln!("roottrace: {reason}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
-            eprintln!("Usage: roottrace --version | roottrace root <file>");
+            eprintln!("{USAGE}");
             ExitCode::from(2)
         }
     }
 }
 
+/// A membership proof for one record position in one batch.
+struct Proof {
+    tree_size: u64,
+    leaf_index: u64,
+    root: [u8; 32],
+    /// Sibling hashes ordered from the leaf level up to the root (RFC 6962
+    /// section 2.1.1).
+    audit_path: Vec<[u8; 32]>,
+}
+
+enum ProveError {
+    Read(String),
+    NoPosition(String),
+}
+
 fn merkle_root_of_file(path: &str) -> Result<[u8; 32], String> {
     let data = fs::read(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
     Ok(mth(&split_records(&data)))
+}
+
+fn membership_proof_of_file(path: &str, leaf_index: u64) -> Result<Proof, ProveError> {
+    let data = fs::read(path).map_err(|e| ProveError::Read(format!("cannot read '{path}': {e}")))?;
+    let records = split_records(&data);
+    let tree_size = records.len() as u64;
+    if leaf_index >= tree_size {
+        return Err(ProveError::NoPosition(format!(
+            "record index {leaf_index} does not exist: the batch holds {tree_size} record(s), valid indices are 0..{}",
+            tree_size.saturating_sub(1)
+        )));
+    }
+    // Positioned purely by index: identical bytes at other positions are
+    // separate records and each position gets its own proof.
+    Ok(Proof {
+        tree_size,
+        leaf_index,
+        root: mth(&records),
+        audit_path: audit_path(&records, leaf_index as usize),
+    })
+}
+
+/// Parse `<record-index>`: a non-empty string of ASCII decimal digits that
+/// fits in an unsigned 64-bit integer. Signs, spaces, leading `+` and other
+/// non-digit characters are rejected.
+fn parse_record_index(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u64>().ok()
+}
+
+/// RFC 6962 section 2.1.1 audit path for record `m` of `leaves`, ordered
+/// from the leaf toward the root. A one-record tree has an empty path; no
+/// leaf is copied or padded for non-power-of-two sizes.
+fn audit_path(leaves: &[&[u8]], m: usize) -> Vec<[u8; 32]> {
+    let n = leaves.len();
+    if n <= 1 {
+        return Vec::new();
+    }
+    // Largest power of two strictly smaller than n.
+    let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
+    if m < k {
+        let mut path = audit_path(&leaves[..k], m);
+        path.push(mth(&leaves[k..]));
+        path
+    } else {
+        let mut path = audit_path(&leaves[k..], m - k);
+        path.push(mth(&leaves[..k]));
+        path
+    }
+}
+
+/// Render the proof as a single JSON object line (with trailing LF), keyed
+/// tree_size, leaf_index, root, audit_path.
+fn render_proof(proof: &Proof) -> String {
+    let mut out = String::new();
+    out.push_str("{\"tree_size\":");
+    out.push_str(&proof.tree_size.to_string());
+    out.push_str(",\"leaf_index\":");
+    out.push_str(&proof.leaf_index.to_string());
+    out.push_str(",\"root\":\"");
+    out.push_str(&hex(&proof.root));
+    out.push_str("\",\"audit_path\":[");
+    for (i, node) in proof.audit_path.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&hex(node));
+        out.push('"');
+    }
+    out.push_str("]}\n");
+    out
 }
 
 /// Split raw bytes into records on LF (0x0a). The separator is not part of
@@ -224,5 +338,183 @@ mod tests {
         expect.extend_from_slice(&left);
         expect.extend_from_slice(&right);
         assert_eq!(hex_of(&mth(&[b"a", b"b", b"c"])), hex_of(&sha256(&expect)));
+    }
+
+    #[test]
+    fn record_index_parsing() {
+        assert_eq!(parse_record_index("0"), Some(0));
+        assert_eq!(parse_record_index("1"), Some(1));
+        assert_eq!(parse_record_index("18446744073709551615"), Some(u64::MAX));
+        // No signs, no leading plus, no spaces, no empties, no non-ASCII digits.
+        for bad in [
+            "", "-1", "+1", "1.0", " 1", "1 ", "0x1", "a", "①", "18446744073709551616",
+        ] {
+            assert_eq!(parse_record_index(bad), None, "must reject {bad:?}");
+        }
+    }
+
+    /// Sibling side for one proof level, ordered leaf -> root.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Side {
+        Left,
+        Right,
+    }
+
+    /// Independently derive the leaf ranges and sides of the audit-path
+    /// siblings straight from the RFC 6962 section 2.1.1 recursive split,
+    /// without computing any hashes the way `audit_path` does. Each entry
+    /// is `(side, sibling_lo, sibling_hi)`.
+    fn sibling_ranges(lo: usize, hi: usize, m: usize, out: &mut Vec<(Side, usize, usize)>) {
+        let n = hi - lo;
+        if n == 1 {
+            return;
+        }
+        let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
+        if m < lo + k {
+            sibling_ranges(lo, lo + k, m, out);
+            out.push((Side::Right, lo + k, hi));
+        } else {
+            sibling_ranges(lo + k, hi, m, out);
+            out.push((Side::Left, lo, lo + k));
+        }
+    }
+
+    /// Verify a proof using only the independently derived sibling ranges:
+    /// every path hash must equal MTH of that sibling's records (looked up
+    /// in the shared memoized table), and folding leaf-to-root must rebuild
+    /// the batch root.
+    fn verify_with_ranges(
+        batch: &[&[u8]],
+        m: usize,
+        path: &[[u8; 32]],
+        mth_at: &impl Fn(usize, usize) -> [u8; 32],
+    ) -> [u8; 32] {
+        let mut ranges = Vec::new();
+        sibling_ranges(0, batch.len(), m, &mut ranges);
+        assert_eq!(ranges.len(), path.len(), "path length mismatch for n={}, m={m}", batch.len());
+
+        let mut leaf_input = vec![0x00];
+        leaf_input.extend_from_slice(batch[m]);
+        let mut node = sha256(&leaf_input);
+        for ((side, lo, hi), sibling) in ranges.iter().zip(path) {
+            let expected = mth_at(*lo, *hi);
+            assert_eq!(sibling, &expected, "wrong sibling hash at level for m={m}, range {lo}..{hi}");
+            node = match side {
+                Side::Right => {
+                    let mut input = Vec::with_capacity(65);
+                    input.push(0x01);
+                    input.extend_from_slice(&node);
+                    input.extend_from_slice(sibling);
+                    sha256(&input)
+                }
+                Side::Left => {
+                    let mut input = Vec::with_capacity(65);
+                    input.push(0x01);
+                    input.extend_from_slice(sibling);
+                    input.extend_from_slice(&node);
+                    sha256(&input)
+                }
+            };
+        }
+        node
+    }
+
+    /// Memoized MTH over index ranges, so exhaustively verifying every
+    /// position does not recompute the same subtree hashes over and over.
+    fn make_mth_memo<'a>(batch: &'a [&'a [u8]]) -> impl Fn(usize, usize) -> [u8; 32] + use<'a> {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        let table: RefCell<HashMap<(usize, usize), [u8; 32]>> = RefCell::new(HashMap::new());
+        // Seed recursively once so the whole subtree table is populated.
+        fn fill(batch: &[&[u8]], lo: usize, hi: usize, table: &mut HashMap<(usize, usize), [u8; 32]>) -> [u8; 32] {
+            if let Some(h) = table.get(&(lo, hi)) {
+                return *h;
+            }
+            let h = if hi - lo == 1 {
+                let mut input = vec![0x00];
+                input.extend_from_slice(batch[lo]);
+                sha256(&input)
+            } else {
+                let n = hi - lo;
+                let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
+                let l = fill(batch, lo, lo + k, table);
+                let r = fill(batch, lo + k, hi, table);
+                let mut input = Vec::with_capacity(65);
+                input.push(0x01);
+                input.extend_from_slice(&l);
+                input.extend_from_slice(&r);
+                sha256(&input)
+            };
+            table.insert((lo, hi), h);
+            h
+        }
+        fill(batch, 0, batch.len(), &mut table.borrow_mut());
+        move |lo, hi| *table.borrow().get(&(lo, hi)).unwrap()
+    }
+
+    #[test]
+    fn audit_paths_verify_for_every_position_and_size() {
+        // Include duplicate content on purpose: proofs must be per position.
+        let leaves: Vec<&[u8]> = vec![
+            b"same", b"b", b"", b"d", b"same", b"f\r", b"\xff\x00", b"h", b"i", b"same",
+        ];
+        // Exhaustive in-process check across the power-of-two boundaries
+        // 2, 4, 8, 16, 32, 64 and 128, every position of every size.
+        const MAX_N: usize = 130;
+        let batch_pool: Vec<&[u8]> = (0..MAX_N)
+            .map(|i| leaves[i % leaves.len()])
+            .collect();
+        for n in 1..=MAX_N {
+            let batch = &batch_pool[..n];
+            let root = mth(batch);
+            let mth_at = make_mth_memo(batch);
+            for m in 0..n {
+                let path = audit_path(batch, m);
+                // A one-record tree has an empty path; every position in a
+                // larger tree has at least one sibling.
+                assert_eq!(path.is_empty(), n == 1, "n={n}, m={m}");
+                assert_eq!(
+                    hex_of(&verify_with_ranges(batch, m, &path, &mth_at)),
+                    hex_of(&root),
+                    "proof must reconstruct root for n={n}, m={m}"
+                );
+            }
+        }
+        // Explicit non-power-of-two short-path cases: a leaf that is itself
+        // the complete right-hand subtree has fewer siblings and no padding.
+        assert_eq!(audit_path(&batch_pool[..3], 2).len(), 1);
+        assert_eq!(audit_path(&batch_pool[..5], 4).len(), 1);
+        assert_eq!(audit_path(&batch_pool[..7], 6).len(), 2);
+        assert_eq!(audit_path(&batch_pool[..33], 32).len(), 1);
+        assert_eq!(audit_path(&batch_pool[..129], 128).len(), 1);
+    }
+
+    #[test]
+    fn duplicate_records_get_position_bound_proofs() {
+        let leaves: Vec<&[u8]> = vec![b"x", b"x", b"x"];
+        let root = mth(&leaves);
+        let p0 = audit_path(&leaves, 0);
+        let p1 = audit_path(&leaves, 1);
+        let p2 = audit_path(&leaves, 2);
+        let mth_at = make_mth_memo(&leaves);
+        // Every position's proof verifies at its own index.
+        for (m, path) in [(0, &p0), (1, &p1), (2, &p2)] {
+            assert_eq!(hex_of(&verify_with_ranges(&leaves, m, path, &mth_at)), hex_of(&root));
+        }
+        // The third leaf is the complete right subtree: short path.
+        assert_eq!(p0.len(), 2);
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p2.len(), 1);
+        // Position binding is in the side sequence: with identical leaves the
+        // hash bytes at one level may coincide, but a verifier uses index and
+        // tree_size to choose the combine side, and the directions differ.
+        let side_seq = |m: usize| {
+            let mut ranges = Vec::new();
+            sibling_ranges(0, 3, m, &mut ranges);
+            ranges.into_iter().map(|(side, _, _)| side).collect::<Vec<_>>()
+        };
+        assert_eq!(side_seq(0), vec![Side::Right, Side::Right]);
+        assert_eq!(side_seq(1), vec![Side::Left, Side::Right]);
+        assert_eq!(side_seq(2), vec![Side::Left]);
     }
 }

@@ -72,6 +72,59 @@ def split_records(data: bytes):
     return records
 
 
+# ---------------------------------------------------------------------------
+# RFC 6962 section 2.1.1 inclusion ("audit") paths and 2.1.2 verification.
+#
+# audit_path is a direct transcription of PATH(m, D[n]): recurse with the same
+# k split as MTH, appending the hash of the sibling subtree on every level,
+# leaf level first. A leaf that is itself a complete subtree (e.g. the last
+# leaf of an uneven tree) naturally gets a shorter path - nothing is copied
+# or padded.
+#
+# verify_inclusion is the section 2.1.2 iterative algorithm (fn/sn), a
+# structurally different computation that must reconstruct MTH(D[n]).
+# ---------------------------------------------------------------------------
+
+def _mth_range(records, lo, hi):
+    n = hi - lo
+    if n == 1:
+        return sha256(b"\x00" + records[lo])
+    k = 1 << ((n - 1).bit_length() - 1)
+    return sha256(b"\x01" + _mth_range(records, lo, lo + k)
+                  + _mth_range(records, lo + k, hi))
+
+
+def audit_path(records, m, lo=0, hi=None):
+    if hi is None:
+        hi = len(records)
+    n = hi - lo
+    if n <= 1:
+        return []
+    k = 1 << ((n - 1).bit_length() - 1)
+    if m < lo + k:
+        path = audit_path(records, m, lo, lo + k)
+        path.append(_mth_range(records, lo + k, hi))
+    else:
+        path = audit_path(records, m, lo + k, hi)
+        path.append(_mth_range(records, lo, lo + k))
+    return path
+
+
+def verify_inclusion(m, n, path, leaf, root):
+    """RFC 6962 2.1.2. Returns True iff `path` proves `leaf` at index m."""
+    fn_index, sn = m, n - 1
+    node = sha256(b"\x00" + leaf)
+    for sibling in path:
+        if (fn_index & 1) == 1 or fn_index == sn:
+            node = sha256(b"\x01" + sibling + node)
+        else:
+            node = sha256(b"\x01" + node + sibling)
+        fn_index >>= 1
+        if sn:
+            sn >>= 1
+    return node == root
+
+
 def root_of_file_bytes(data: bytes):
     recs = split_records(data)
     a, b = mth_recursive(recs), mth_fold(recs)
@@ -309,6 +362,51 @@ def main():
     assert roots["V_DUP_INSERT"] != roots["B9"]
     assert roots["EMPTY"] != roots["ONE_LF"]
     assert roots["EMPTY"] == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    # Inclusion-path self-check: for every record of every nonempty batch the
+    # recursive section 2.1.1 PATH must be accepted by the section 2.1.2
+    # iterative verifier, be at most ceil(log2(n)) hashes long, be empty only
+    # for a one-record tree, and be position-specific (byte-identical records
+    # at different indices are not interchangeable proofs).
+    for name, data, _desc, _trailing in BATCHES:
+        recs = split_records(data)
+        n = len(recs)
+        root, _ = root_of_file_bytes(data)
+        root_bytes = bytes.fromhex(root)
+        per_index = []
+        for m in range(n):
+            path = audit_path(recs, m)
+            assert verify_inclusion(m, n, path, recs[m], root_bytes), (name, m)
+            if n == 1:
+                assert path == []
+            else:
+                assert 1 <= len(path) <= (n - 1).bit_length(), (name, m, len(path))
+            per_index.append(path)
+        # Duplicate-content positions in B9 (r0 == r4) must carry distinct
+        # path values or a distinct number of hashes.
+        if name == "B9":
+            assert recs[0] == recs[4]
+            assert per_index[0] != per_index[4]
+            # The ninth leaf is the complete right subtree: one sibling only.
+            assert [h.hex() for h in per_index[8]] == [roots["B8"]]
+
+    # Fixed inclusion paths for selected B9 positions (paste into
+    # tests/prove_regression.rs). Each was accepted by verify_inclusion above.
+    print("# Rust inclusion-path constants for B9 (leaf -> root, paste into")
+    print("# tests/prove_regression.rs):")
+    b9 = split_records(join_lf(BASE9))
+    b9_root = bytes.fromhex(roots["B9"])
+    for m in (0, 1, 4, 7):
+        path = audit_path(b9, m)
+        assert verify_inclusion(m, len(b9), path, b9[m], b9_root)
+        print(f"const PATH_B9_M{m}: &[&str] = &[")
+        for h in path:
+            print(f'    "{h.hex()}",')
+        print("];")
+        print()
+    print("# B9 m=8 has a one-hash path equal to ROOT_B8:")
+    print('#   ["%s"]' % audit_path(b9, 8)[0].hex())
+    print()
 
     # Long-record sanity: every boundary length has its own root, the tail-byte
     # variants differ from their originals (and from one another), and the
