@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -79,32 +80,109 @@ func newStore(dataDir string) (*store, error) {
 	return &store{path: path}, nil
 }
 
-// load 读取并解析全部记录。读不到、JSON 损坏、结构异常或任一场地的
-// 开放时段不合法都返回错误，调用方必须按 500 处理，绝不能把错误数据
-// 当作空列表覆盖，也不能跳过异常场地只返回剩余记录。
+// load 读取并解析全部记录。读不到、JSON 损坏、结构异常，或任一场地的
+// 名称、容量、时区、开放时段不满足新增时公开的有效性规则，都返回错误，
+// 调用方必须按 500 处理：绝不能把错误数据当作空列表覆盖，不能跳过异常
+// 场地只返回剩余记录，也不能把异常值补齐或改写成合法值。
+//
+// 先解码成 []json.RawMessage 而不是直接解码成 []Venue：强类型解码会把
+// 缺失/null/空白名称、零值或负数容量、缺失/空时区静默变成零值，也会把
+// 数组里的 null 条目变成一条全零场地。逐条解码时由 venueCapacity 拦截
+// 容量异常，字符串字段的类型错误直接成为解码错误，再补上名称、时区的
+// 业务规则校验。weeklyHours 缺省或为 null 仍是唯一保留的旧数据兼容。
 func (s *store) load() ([]Venue, error) {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		return nil, err
 	}
-	var venues []Venue
-	if err := json.Unmarshal(raw, &venues); err != nil {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil, fmt.Errorf("venues data is corrupted: %w", err)
 	}
-	if venues == nil {
-		venues = []Venue{}
-	}
-	for i := range venues {
-		// 兼容旧数据：字段缺省或为 null 仍按空数组（暂未开放）读取。
-		if venues[i].WeeklyHours == nil {
-			venues[i].WeeklyHours = []WeeklyHour{}
+	venues := make([]Venue, 0, len(items))
+	for i, item := range items {
+		// 数组中的 null 条目不能变成名称为空、容量为零的场地。
+		if isJSONNull(item) {
+			return nil, fmt.Errorf("venues data is corrupted: venues[%d] is null", i)
+		}
+		var stored storedVenue
+		if err := json.Unmarshal(item, &stored); err != nil {
+			return nil, fmt.Errorf("venues data is corrupted: venues[%d]: %w", i, err)
+		}
+		// 名称：缺失或为 null 时解码为 ""，空白名称去除首尾空白后为空。
+		// 只按去除空白后的结果判断合法性，但返回时保留名称原文，不改写。
+		if strings.TrimSpace(stored.Name) == "" {
+			return nil, fmt.Errorf("venues data is corrupted: venue %q has invalid name", stored.ID)
+		}
+		// 容量：显式 null、类型错误、零、负数、带小数或超范围已由
+		// venueCapacity.UnmarshalJSON 拒绝；字段缺省时不会调用该方法，
+		// 值保持 0，这里同样按异常处理。
+		if stored.Capacity <= 0 {
+			return nil, fmt.Errorf("venues data is corrupted: venue %q has invalid capacity", stored.ID)
+		}
+		// 时区：缺失/null 解码为 ""；空字符串、Local 与无法加载的 IANA
+		// 名称都与新增请求的公开规则保持一致，按数据损坏处理。
+		if stored.Timezone == "" || stored.Timezone == "Local" {
+			return nil, fmt.Errorf("venues data is corrupted: venue %q has invalid timezone", stored.ID)
+		}
+		if _, err := time.LoadLocation(stored.Timezone); err != nil {
+			return nil, fmt.Errorf("venues data is corrupted: venue %q has invalid timezone: %w", stored.ID, err)
+		}
+		// 兼容旧数据：weeklyHours 缺省或为 null 仍按空数组（暂未开放）读取。
+		hours := stored.WeeklyHours
+		if hours == nil {
+			hours = []WeeklyHour{}
 		}
 		// 已保存数据同样必须满足新增时的全部时段规则；任一非法即视为损坏。
-		if err := validateHours(venues[i].WeeklyHours); err != nil {
-			return nil, fmt.Errorf("venues data is corrupted: venue %q has invalid weekly hours: %w", venues[i].ID, err)
+		if err := validateHours(hours); err != nil {
+			return nil, fmt.Errorf("venues data is corrupted: venue %q has invalid weekly hours: %w", stored.ID, err)
 		}
+		venues = append(venues, Venue{
+			ID:          stored.ID,
+			Name:        stored.Name,
+			Capacity:    int(stored.Capacity),
+			Timezone:    stored.Timezone,
+			WeeklyHours: hours,
+		})
 	}
 	return venues, nil
+}
+
+// isJSONNull 判断一个原始 JSON 值是否为 null（允许周围有空白）。
+func isJSONNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
+}
+
+// storedVenue 是已保存场地记录的严格解码形状。WeeklyHours 保留缺省/null
+// 的旧数据兼容，其余字段一律按新增时公开的规则重新校验。
+type storedVenue struct {
+	ID          string        `json:"id"`
+	Name        string        `json:"name"`
+	Capacity    venueCapacity `json:"capacity"`
+	Timezone    string        `json:"timezone"`
+	WeeklyHours []WeeklyHour  `json:"weeklyHours"`
+}
+
+// venueCapacity 是已保存记录容量字段的解码类型。默认的整数解码会把 null、
+// 字符串等悄悄变成零值或跳过，这里改为复用新增路径的精确 JSON 整数判断：
+// 显式 null、非数字类型、零、负数、带小数部分或超出服务端支持范围都算
+// 数据异常。字段缺省时 UnmarshalJSON 不会被调用（值保持 0），由调用方
+// 再做一次正数检查。
+type venueCapacity int64
+
+func (c *venueCapacity) UnmarshalJSON(b []byte) error {
+	if isJSONNull(b) {
+		return errors.New("capacity 不能为 null")
+	}
+	z, sign, isInt, inRange := parseJSONInteger(json.Number(b))
+	if !isInt || sign <= 0 {
+		return errors.New("capacity 必须是正整数")
+	}
+	if !inRange || z.Int64() > maxVenueCapacity {
+		return errors.New("capacity 超出支持范围")
+	}
+	*c = venueCapacity(z.Int64())
+	return nil
 }
 
 // save 通过同目录临时文件 + 重命名原子写入，避免半写状态损坏数据。

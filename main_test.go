@@ -952,3 +952,288 @@ func TestValidSavedHoursUnchanged(t *testing.T) {
 		t.Fatalf("first hours slot changed: %v", first)
 	}
 }
+
+// ---- 存量记录基础字段（名称/容量/时区）异常 ----
+
+// validStoredVenue 返回一条各字段都合法的存量记录（map 形态，便于按用例
+// 删字段或写入 null/错误类型）。
+func validStoredVenue() map[string]any {
+	return map[string]any{
+		"id":          "v-ok",
+		"name":        "正常场地",
+		"capacity":    20,
+		"timezone":    "Asia/Shanghai",
+		"weeklyHours": []any{},
+	}
+}
+
+// writeRawVenuesFile 直接写入未经 Go 重新编码的原始 JSON，用于写入超大整数
+// 容量等需要逐位控制文本的存量数据。
+func writeRawVenuesFile(t *testing.T, s *store, raw string) {
+	t.Helper()
+	if err := os.WriteFile(s.path, []byte(raw), 0600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+}
+
+// TestInvalidSavedBaseFieldsTreatedAsCorruption 覆盖需求列举的全部基础字段
+// 异常：名称缺失/null/空白/类型错误，容量缺失/null/零/负数/小数/类型错误，
+// 时区缺失/null/空/Local/非法 IANA/类型错误，以及数组中的 null 条目。
+// 每种异常都必须让 GET 返回 500（带非空 error、不带 venues 列表），让内容
+// 合法的新增同样返回 500，且不新增、不补齐、不重写已有异常记录。
+func TestInvalidSavedBaseFieldsTreatedAsCorruption(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{"missing name", func(r map[string]any) { delete(r, "name") }},
+		{"null name", func(r map[string]any) { r["name"] = nil }},
+		{"empty name", func(r map[string]any) { r["name"] = "" }},
+		{"blank name", func(r map[string]any) { r["name"] = "   \t\n " }},
+		{"name wrong type", func(r map[string]any) { r["name"] = 42 }},
+
+		{"missing capacity", func(r map[string]any) { delete(r, "capacity") }},
+		{"null capacity", func(r map[string]any) { r["capacity"] = nil }},
+		{"zero capacity", func(r map[string]any) { r["capacity"] = 0 }},
+		{"negative capacity", func(r map[string]any) { r["capacity"] = -3 }},
+		{"fractional capacity", func(r map[string]any) { r["capacity"] = 12.5 }},
+		{"capacity wrong type string", func(r map[string]any) { r["capacity"] = "100" }},
+		{"capacity wrong type bool", func(r map[string]any) { r["capacity"] = true }},
+		{"capacity wrong type object", func(r map[string]any) { r["capacity"] = map[string]any{} }},
+
+		{"missing timezone", func(r map[string]any) { delete(r, "timezone") }},
+		{"null timezone", func(r map[string]any) { r["timezone"] = nil }},
+		{"empty timezone", func(r map[string]any) { r["timezone"] = "" }},
+		{"blank timezone", func(r map[string]any) { r["timezone"] = "   " }},
+		{"local timezone", func(r map[string]any) { r["timezone"] = "Local" }},
+		{"unknown timezone", func(r map[string]any) { r["timezone"] = "Asia/NoSuchCity" }},
+		{"timezone wrong type", func(r map[string]any) { r["timezone"] = 8 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, h := newTestServer(t)
+			rec := validStoredVenue()
+			tc.mutate(rec)
+			original := writeVenuesFile(t, s, []any{rec})
+
+			// GET 必须 500：非空 error，不返回场地列表。
+			get := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+			if get.Code != http.StatusInternalServerError {
+				t.Fatalf("GET: status = %d, want 500, body = %s", get.Code, get.Body.String())
+			}
+			body := decodeBody(t, get)
+			if msg, _ := body["error"].(string); msg == "" {
+				t.Fatalf("500 must carry non-empty error, got %v", body)
+			}
+			if _, present := body["venues"]; present {
+				t.Fatalf("corrupted store must not return a venues list, got %v", body)
+			}
+
+			// 内容完全合法的新增同样 500。
+			post := doJSON(t, h, http.MethodPost, "/api/venues", validPayload())
+			if post.Code != http.StatusInternalServerError {
+				t.Fatalf("POST: status = %d, want 500, body = %s", post.Code, post.Body.String())
+			}
+			if msg, _ := decodeBody(t, post)["error"].(string); msg == "" {
+				t.Fatalf("POST 500 must carry non-empty error, body = %s", post.Body.String())
+			}
+
+			// 已有异常记录必须原样保留：不新增、不删除、不补齐、不重写。
+			after, err := os.ReadFile(s.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != original {
+				t.Fatalf("corrupted records must be preserved untouched:\nbefore=%s\nafter =%s", original, string(after))
+			}
+
+			// 异常未修复前持续读取失败。
+			if again := doJSON(t, h, http.MethodGet, "/api/venues", nil); again.Code != http.StatusInternalServerError {
+				t.Fatalf("second GET: status = %d, want 500", again.Code)
+			}
+		})
+	}
+
+	// 数组中的 null 条目不能变成名称为空、容量为零的场地。
+	t.Run("null entry in array", func(t *testing.T) {
+		s, h := newTestServer(t)
+		original := writeVenuesFile(t, s, []any{nil})
+		get := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+		if get.Code != http.StatusInternalServerError {
+			t.Fatalf("GET with null entry: status = %d, want 500, body = %s", get.Code, get.Body.String())
+		}
+		if msg, _ := decodeBody(t, get)["error"].(string); msg == "" {
+			t.Fatalf("null entry response must carry non-empty error")
+		}
+		post := doJSON(t, h, http.MethodPost, "/api/venues", validPayload())
+		if post.Code != http.StatusInternalServerError {
+			t.Fatalf("POST with null entry: status = %d, want 500", post.Code)
+		}
+		after, err := os.ReadFile(s.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(after) != original {
+			t.Fatalf("null entry must be preserved untouched:\nbefore=%s\nafter =%s", original, string(after))
+		}
+	})
+}
+
+// TestCorruptBaseFieldAlongsideValidVenuesRejectsWholeList 异常记录无论排在
+// 正常场地之前还是之后，整次读取都必须失败，不能只返回正常场地。
+func TestCorruptBaseFieldAlongsideValidVenuesRejectsWholeList(t *testing.T) {
+	bad := validStoredVenue()
+	bad["id"] = "v-bad"
+	bad["capacity"] = 0
+	cases := []struct {
+		name   string
+		venues []any
+	}{
+		{"bad after valid", []any{validStoredVenue(), bad}},
+		{"bad before valid", []any{bad, validStoredVenue()}},
+		{"bad between valid", []any{validStoredVenue(), bad, validStoredVenue()}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, h := newTestServer(t)
+			writeVenuesFile(t, s, tc.venues)
+
+			get := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+			if get.Code != http.StatusInternalServerError {
+				t.Fatalf("GET: status = %d, want 500, body = %s", get.Code, get.Body.String())
+			}
+			if _, present := decodeBody(t, get)["venues"]; present {
+				t.Fatalf("must not return a partial list of the valid venues")
+			}
+
+			// 合法新增也必须失败，且文件内容（含异常记录与原有顺序）不变。
+			before, err := os.ReadFile(s.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			post := doJSON(t, h, http.MethodPost, "/api/venues", validPayload())
+			if post.Code != http.StatusInternalServerError {
+				t.Fatalf("POST: status = %d, want 500, body = %s", post.Code, post.Body.String())
+			}
+			after, err := os.ReadFile(s.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(before) {
+				t.Fatalf("records must be untouched after rejected POST:\nbefore=%s\nafter =%s", before, after)
+			}
+		})
+	}
+}
+
+// TestStoredNameWithSurroundingWhitespacePreserved 名称合法性按去除首尾空白
+// 后的结果判断，但读取只能原样返回，不能顺便 trim；这种合法旧记录上仍能
+// 正常新增场地，且新增不影响旧记录的名称原文与顺序。
+func TestStoredNameWithSurroundingWhitespacePreserved(t *testing.T) {
+	s, h := newTestServer(t)
+	legacy := validStoredVenue()
+	legacy["id"] = "v-spaced"
+	legacy["name"] = "  音乐厅  "
+	writeVenuesFile(t, s, []any{legacy})
+
+	get := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+	if get.Code != http.StatusOK {
+		t.Fatalf("whitespace-padded name is valid after trim: status = %d, body = %s", get.Code, get.Body.String())
+	}
+	venues := decodeBody(t, get)["venues"].([]any)
+	if len(venues) != 1 {
+		t.Fatalf("expected 1 venue, got %v", venues)
+	}
+	if got := venues[0].(map[string]any)["name"]; got != "  音乐厅  " {
+		t.Fatalf("name must be returned verbatim, got %q", got)
+	}
+
+	// 合法旧记录之上仍可新增，旧名称原文与创建顺序保持不变。
+	post := doJSON(t, h, http.MethodPost, "/api/venues", validPayload())
+	if post.Code != http.StatusCreated {
+		t.Fatalf("valid POST on legacy data: status = %d, body = %s", post.Code, post.Body.String())
+	}
+	get = doJSON(t, h, http.MethodGet, "/api/venues", nil)
+	venues = decodeBody(t, get)["venues"].([]any)
+	if len(venues) != 2 {
+		t.Fatalf("expected 2 venues, got %d", len(venues))
+	}
+	first := venues[0].(map[string]any)
+	if first["id"] != "v-spaced" || first["name"] != "  音乐厅  " {
+		t.Fatalf("legacy record changed: %v", first)
+	}
+	if second := venues[1].(map[string]any)["name"]; second != "音乐厅" {
+		t.Fatalf("new venue name = %v, want 音乐厅", second)
+	}
+}
+
+// TestStoredLargeCapacityPreservedExactly 超过 JavaScript 安全整数范围、但在
+// 服务端支持范围内的存量容量，读取时必须逐位保留，不能因校验路径改变而被
+// 舍入或判为异常，且其上仍可新增合法场地。
+func TestStoredLargeCapacityPreservedExactly(t *testing.T) {
+	s, h := newTestServer(t)
+	const exact = "9007199254740993" // 2^53+1
+	writeRawVenuesFile(t, s, `[`+
+		`{"id":"v-big","name":"超大容量馆","capacity":`+exact+
+		`,"timezone":"Asia/Shanghai","weeklyHours":[]}]`)
+
+	get := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+	if get.Code != http.StatusOK {
+		t.Fatalf("large in-range capacity must load: status = %d, body = %s", get.Code, get.Body.String())
+	}
+	var listed struct {
+		Venues []struct {
+			ID       string      `json:"id"`
+			Name     string      `json:"name"`
+			Capacity json.Number `json:"capacity"`
+			Timezone string      `json:"timezone"`
+		} `json:"venues"`
+	}
+	if err := json.Unmarshal(get.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Venues) != 1 || listed.Venues[0].Capacity.String() != exact {
+		t.Fatalf("listed capacity = %+v, want exactly [%s]", listed.Venues, exact)
+	}
+
+	// 大整数容量合法：其上新增合法场地仍成功，旧容量逐位不变。
+	post := doJSON(t, h, http.MethodPost, "/api/venues", validPayload())
+	if post.Code != http.StatusCreated {
+		t.Fatalf("valid POST: status = %d, body = %s", post.Code, post.Body.String())
+	}
+	get = doJSON(t, h, http.MethodGet, "/api/venues", nil)
+	if err := json.Unmarshal(get.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Venues) != 2 || listed.Venues[0].Capacity.String() != exact {
+		t.Fatalf("legacy large capacity changed after create: %+v", listed.Venues)
+	}
+}
+
+// TestStoredOutOfRangeCapacityIsCorruption 超出服务端支持范围的整数容量不可
+// 能来自合法新增（新增会 400），存量中出现时按数据损坏处理：GET 与合法
+// 新增都返回 500，且不能截断成相邻整数后返回。
+func TestStoredOutOfRangeCapacityIsCorruption(t *testing.T) {
+	s, h := newTestServer(t)
+	writeRawVenuesFile(t, s, `[`+
+		`{"id":"v-huge","name":"超限存量馆","capacity":9223372036854775808`+
+		`,"timezone":"UTC","weeklyHours":[]}]`)
+	get := doJSON(t, h, http.MethodGet, "/api/venues", nil)
+	if get.Code != http.StatusInternalServerError {
+		t.Fatalf("out-of-range stored capacity: status = %d, want 500, body = %s", get.Code, get.Body.String())
+	}
+	if msg, _ := decodeBody(t, get)["error"].(string); msg == "" {
+		t.Fatalf("500 must carry non-empty error")
+	}
+	post := doJSON(t, h, http.MethodPost, "/api/venues", validPayload())
+	if post.Code != http.StatusInternalServerError {
+		t.Fatalf("POST with out-of-range stored capacity: status = %d, want 500", post.Code)
+	}
+	after, err := os.ReadFile(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(after), "9223372036854775808") {
+		t.Fatalf("out-of-range record must not be truncated or rewritten:\n%s", after)
+	}
+}
