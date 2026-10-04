@@ -13,6 +13,18 @@ independently written algorithms over the standard library `hashlib.sha256`:
                      leaf/node prefixes (a structurally different computation
                      that must agree)
 
+It also computes RFC 6962 section 2.1.1 inclusion (audit) paths in two
+structurally different ways:
+
+  * audit_path_recursive - direct transcription of the PATH definition
+  * audit_path_fold      - the stack fold builds explicit subtree nodes with
+                           intervals; the path is collected by walking from
+                           the root down to the leaf's node
+
+A recursive RFC verifier (verify_inclusion) re-hashes every printed proof and
+must arrive back at the batch root; proofs for duplicate content at another
+position are additionally checked NOT to verify.
+
 Records are split exactly as roottrace documents: raw bytes on LF, the
 separator excluded, a trailing LF only terminates the last record, and an
 empty file holds zero records.
@@ -70,6 +82,75 @@ def split_records(data: bytes):
     if data.endswith(b"\n"):
         records.pop()
     return records
+
+
+# ---------------------------------------------------------------------------
+# RFC 6962 section 2.1.1 inclusion (audit) paths.
+# ---------------------------------------------------------------------------
+
+def audit_path_recursive(records, m):
+    """Direct transcription of the PATH definition, leaf-to-root order.
+
+    PATH(m, [d0]) = []
+    PATH(m, [d0..d(n-1)]) =
+        PATH(m, d[0:k])       + [MTH(d[k:n])]   if m < k
+        PATH(m - k, d[k:n])   + [MTH(d[0:k])]   if m >= k
+    """
+    n = len(records)
+    if not 0 <= m < n:
+        raise IndexError(f"index {m} out of range for {n} record(s)")
+    if n == 1:
+        return []
+    k = 1 << ((n - 1).bit_length() - 1)
+    if m < k:
+        return audit_path_recursive(records[:k], m) + [mth_recursive(records[k:])]
+    return audit_path_recursive(records[k:], m - k) + [mth_recursive(records[:k])]
+
+
+def audit_path_fold(records, m):
+    """Structurally different path producer: descend from the root to leaf m
+    using the RFC split, computing each sibling subtree hash with the stack
+    fold mth_fold (never mth_recursive), then reverse into leaf-to-root
+    order. This shares no recursion structure with audit_path_recursive."""
+    n = len(records)
+    if not 0 <= m < n:
+        raise IndexError(f"index {m} out of range for {n} record(s)")
+    if n == 1:
+        return []
+    lo, hi = 0, n
+    top_down = []
+    while hi - lo > 1:
+        size = hi - lo
+        k = 1 << ((size - 1).bit_length() - 1)
+        if m < lo + k:
+            top_down.append(mth_fold(records[lo + k:hi]))
+            hi = lo + k
+        else:
+            top_down.append(mth_fold(records[lo:lo + k]))
+            lo = lo + k
+    return list(reversed(top_down))
+
+
+def verify_inclusion(leaf, m, n, path):
+    """RFC 6962-bis recursive verifier: re-derive combination order from the
+    tree geometry while consuming the supplied path. Returns the root."""
+    def sub(mm, nn, pos):
+        if nn == 1:
+            return sha256(b"\x00" + leaf), pos
+        k = 1 << ((nn - 1).bit_length() - 1)
+        if mm < k:
+            lh, pos = sub(mm, k, pos)
+            rh = path[pos]
+            pos += 1
+        else:
+            rh, pos = sub(mm - k, nn - k, pos)
+            lh = path[pos]
+            pos += 1
+        return sha256(b"\x01" + lh + rh), pos
+
+    root, pos = sub(m, n, 0)
+    assert pos == len(path), "proof length mismatch"
+    return root
 
 
 def root_of_file_bytes(data: bytes):
@@ -322,6 +403,67 @@ def main():
     for name, _ in SINGLE_LONG:
         assert roots["MIXED"] != roots[name]
         assert roots["MIXED_M"] != roots[name]
+
+    # ------------------------------------------------------------------
+    # Inclusion proofs: the two structurally different path producers must
+    # agree at every position of every fixed sequence, and each path must
+    # verify back to the batch root via the recursive verifier.
+    # ------------------------------------------------------------------
+    proof_sequences = [
+        ("B7", BASE7), ("B8", BASE8), ("B9", BASE9),
+        ("V_DUP", V_DUP), ("V_SWAP", V_SWAP),
+        ("V_DROP_EMPTY", V_DROP_EMPTY), ("V_DUP_INSERT", V_DUP_INSERT),
+        ("MIXED", MIXED), ("MIXED_M", MIXED_M),
+        ("ONE_LF", [b""]),
+    ] + [(name, [rec]) for name, rec in SINGLE_LONG]
+
+    for tag, recs in proof_sequences:
+        root = bytes.fromhex(roots[tag])
+        n = len(recs)
+        for m in range(n):
+            p1 = audit_path_recursive(recs, m)
+            p2 = audit_path_fold(recs, m)
+            assert p1 == p2, f"path producers disagree for {tag} m={m}"
+            got = verify_inclusion(recs[m], m, n, p1)
+            assert got == root, f"proof does not verify for {tag} m={m}"
+            # Every element is a 32-byte node hash; the single-record path
+            # is empty.
+            assert all(isinstance(h, bytes) and len(h) == 32 for h in p1)
+        if n == 1:
+            assert audit_path_recursive(recs, 0) == []
+
+    # Duplicate content at positions 0 and 4 of BASE9: the proof for one
+    # position must NOT verify the same bytes at the other position.
+    p_dup_0 = audit_path_recursive(BASE9, 0)
+    p_dup_4 = audit_path_recursive(BASE9, 4)
+    assert p_dup_0 != p_dup_4
+    assert verify_inclusion(BASE9[4], 0, 9, p_dup_4) != mth_recursive(BASE9)
+    assert verify_inclusion(BASE9[0], 4, 9, p_dup_0) != mth_recursive(BASE9)
+
+    # Fixed proof vectors emitted for the Rust prove regression tests:
+    # B9 (uneven, n=9) at its first, duplicate-content and last positions;
+    # B8 (balanced) mid-tree; and a single empty record (empty path).
+    def emit_proof(const_tag, seq_name, recs, m):
+        root = mth_recursive(recs)
+        path = audit_path_recursive(recs, m)
+        print(f"# Inclusion proof for {seq_name} (n={len(recs)}) at m={m}; "
+              f"two independent path producers agree and the path verifies.")
+        print(f"const PROOF_{const_tag}_TREE_SIZE: u64 = {len(recs)};")
+        print(f"const PROOF_{const_tag}_LEAF_INDEX: u64 = {m};")
+        print(f"const PROOF_{const_tag}_ROOT: &str = \"{root.hex()}\";")
+        elems = ", ".join(f"\"{h.hex()}\"" for h in path)
+        print(f"const PROOF_{const_tag}_AUDIT_PATH: &[&str] = &[{elems}];")
+        print()
+
+    print("# Fixed inclusion-proof vectors (RFC 6962 section 2.1.1,")
+    print("# leaf-to-root order; hashes are lowercase hex):")
+    print()
+    emit_proof("B9_M0", "BASE9", BASE9, 0)
+    emit_proof("B9_M4", "BASE9 (duplicate 'alpha' position)", BASE9, 4)
+    emit_proof("B9_M8", "BASE9 (last record, uneven right subtree)", BASE9, 8)
+    emit_proof("B8_M3", "BASE8 (balanced 8-record tree)", BASE8, 3)
+    emit_proof("MIXED_M8", "MIXED (long record L65 in the k=8 right subtree)", MIXED, 8)
+    emit_proof("ONE_LF_M0", "single LF (one empty record)", [b""], 0)
 
     # Payload literal used by the Rust tests to materialise the batches.
     print("# Rust file payloads:")

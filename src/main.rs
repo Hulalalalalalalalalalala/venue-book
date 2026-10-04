@@ -4,6 +4,35 @@ use std::process::ExitCode;
 
 const VERSION: &str = "0.1.0";
 
+const USAGE: &str = "\
+Usage:
+    roottrace root <file>
+    roottrace prove <file> <record-index>
+    roottrace --version
+
+Commands:
+    root <file>
+        Print the SHA-256 RFC 6962 Merkle Tree Hash of all records in <file>
+        as one line of 64 lowercase hexadecimal characters.
+
+    prove <file> <record-index>
+        Print the RFC 6962 section 2.1.1 inclusion (membership) proof for the
+        record at <record-index> within the whole batch. The index is
+        0-based and counts records in file order: 0 is the first record,
+        1 the second, and so on; the same content at multiple positions gets
+        the proof for the exact position given, with no deduplication. Output
+        is one JSON object with the fields tree_size, leaf_index, root and
+        audit_path (leaf-to-root hashes, lowercase hex; empty for a batch of
+        exactly one record).
+
+        Example:
+            roottrace prove batch.txt 0
+
+Exit status:
+    0  success
+    1  the file cannot be read, or the record index does not exist
+    2  usage error (unknown command, missing or extra arguments, bad index)";
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.as_slice() {
@@ -21,16 +50,102 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        [cmd, path, index] if cmd == "prove" => match parse_index(index) {
+            Some(index) => match proof_for_file(path, index) {
+                Ok(proof) => {
+                    println!("{}", proof);
+                    ExitCode::SUCCESS
+                }
+                Err(ProveError::Read(reason)) => {
+                    eprintln!("roottrace: {reason}");
+                    ExitCode::FAILURE
+                }
+                Err(ProveError::Missing(index, size)) => {
+                    if size == 0 {
+                        eprintln!(
+                            "roottrace: record index {index} does not exist: the file holds zero records"
+                        );
+                    } else {
+                        eprintln!(
+                            "roottrace: record index {index} does not exist: file holds {size} record(s), valid indices are 0 through {}",
+                            size - 1
+                        );
+                    }
+                    ExitCode::FAILURE
+                }
+            },
+            None => {
+                eprintln!("roottrace: invalid record index '{index}': expected a decimal non-negative integer of ASCII digits");
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         _ => {
-            eprintln!("Usage: roottrace --version | roottrace root <file>");
+            eprintln!("{USAGE}");
             ExitCode::from(2)
         }
     }
 }
 
+enum ProveError {
+    Read(String),
+    Missing(u64, u64),
+}
+
 fn merkle_root_of_file(path: &str) -> Result<[u8; 32], String> {
     let data = fs::read(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
     Ok(mth(&split_records(&data)))
+}
+
+fn proof_for_file(path: &str, index: u64) -> Result<String, ProveError> {
+    let data = fs::read(path).map_err(|e| ProveError::Read(format!("cannot read '{path}': {e}")))?;
+    let records = split_records(&data);
+    let size = records.len() as u64;
+    if index >= size {
+        return Err(ProveError::Missing(index, size));
+    }
+    let idx = index as usize;
+    let root = mth(&records);
+    let audit_path = inclusion_path(&records, idx);
+    Ok(proof_json(size, index, &root, &audit_path))
+}
+
+/// Parse a record index: one or more ASCII decimal digits, non-negative, no
+/// sign or whitespace, fitting in an unsigned 64-bit integer. Anything else
+/// (including "+1", " 1", "1.0", "", "-1") is rejected.
+fn parse_index(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for b in text.bytes() {
+        value = value.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+    }
+    Some(value)
+}
+
+/// Build the one-line JSON object printed by `prove`: integer tree_size and
+/// leaf_index, the lowercase-hex root, and the audit path as a JSON array of
+/// lowercase-hex hashes ordered leaf to root.
+fn proof_json(tree_size: u64, leaf_index: u64, root: &[u8; 32], audit_path: &[[u8; 32]]) -> String {
+    let mut out = String::new();
+    out.push_str("{\"tree_size\":");
+    out.push_str(&tree_size.to_string());
+    out.push_str(",\"leaf_index\":");
+    out.push_str(&leaf_index.to_string());
+    out.push_str(",\"root\":\"");
+    out.push_str(&hex(root));
+    out.push_str("\",\"audit_path\":[");
+    for (i, node) in audit_path.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&hex(node));
+        out.push('"');
+    }
+    out.push_str("]}");
+    out
 }
 
 /// Split raw bytes into records on LF (0x0a). The separator is not part of
@@ -68,6 +183,42 @@ fn mth(leaves: &[&[u8]]) -> [u8; 32] {
             input.extend_from_slice(&right);
             sha256(&input)
         }
+    }
+}
+
+/// RFC 6962 section 2.1.1 Merkle Audit Path for the record at `m` within a
+/// batch of `n` records, ordered from the leaf level up to the root.
+///
+/// ```text
+/// PATH(m, [d0]) = []
+/// PATH(m, [d0..d(n-1)]) = PATH(m, [d0..d(k-1)]) + MTH([dk..d(n-1)])   if m < k
+///                       = PATH(m, [dk..d(n-1)]) + MTH([d0..d(k-1)])   if m >= k
+/// ```
+///
+/// with k the largest power of two strictly smaller than n. Uneven batches
+/// are handled by the recursion itself: no leaf is duplicated and no empty
+/// record is appended to round the size up to a power of two.
+fn inclusion_path(leaves: &[&[u8]], m: usize) -> Vec<[u8; 32]> {
+    let n = leaves.len();
+    assert!(m < n, "leaf index {m} out of range for {n} record(s)");
+    let mut path = Vec::new();
+    inclusion_path_rec(leaves, m, &mut path);
+    path
+}
+
+fn inclusion_path_rec(leaves: &[&[u8]], m: usize, path: &mut Vec<[u8; 32]>) {
+    let n = leaves.len();
+    if n == 1 {
+        return;
+    }
+    // Largest power of two strictly smaller than n.
+    let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
+    if m < k {
+        inclusion_path_rec(&leaves[..k], m, path);
+        path.push(mth(&leaves[k..]));
+    } else {
+        inclusion_path_rec(&leaves[k..], m - k, path);
+        path.push(mth(&leaves[..k]));
     }
 }
 
@@ -168,6 +319,53 @@ mod tests {
         hex(d)
     }
 
+    /// Leaf hash: SHA-256(0x00 || data).
+    fn leaf_hash(data: &[u8]) -> [u8; 32] {
+        let mut input = vec![0x00];
+        input.extend_from_slice(data);
+        sha256(&input)
+    }
+
+    fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut input = Vec::with_capacity(65);
+        input.push(0x01);
+        input.extend_from_slice(left);
+        input.extend_from_slice(right);
+        sha256(&input)
+    }
+
+    /// Verify an RFC 6962 inclusion proof with the RFC's recursive verifier:
+    /// it re-derives the combination order from the tree geometry (k =
+    /// largest power of two below the current subtree size) while consuming
+    /// exactly the supplied sibling hashes. A wrong length, order or hash
+    /// fails; the root computed here must equal the tree root.
+    fn verify_proof(leaf: &[u8], m: usize, n: usize, path: &[[u8; 32]]) -> [u8; 32] {
+        assert!(m < n);
+        fn sub(leaf: &[u8], m: usize, n: usize, path: &[[u8; 32]], pos: &mut usize) -> [u8; 32] {
+            if n == 1 {
+                return leaf_hash(leaf);
+            }
+            let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
+            if m < k {
+                let left = sub(leaf, m, k, path, pos);
+                assert!(*pos < path.len(), "proof too short");
+                let right = path[*pos];
+                *pos += 1;
+                node_hash(&left, &right)
+            } else {
+                let right = sub(leaf, m - k, n - k, path, pos);
+                assert!(*pos < path.len(), "proof too short");
+                let left = path[*pos];
+                *pos += 1;
+                node_hash(&left, &right)
+            }
+        }
+        let mut pos = 0;
+        let root = sub(leaf, m, n, path, &mut pos);
+        assert_eq!(pos, path.len(), "proof too long: {pos} consumed of {}", path.len());
+        root
+    }
+
     #[test]
     fn sha256_known_vectors() {
         assert_eq!(
@@ -224,5 +422,99 @@ mod tests {
         expect.extend_from_slice(&left);
         expect.extend_from_slice(&right);
         assert_eq!(hex_of(&mth(&[b"a", b"b", b"c"])), hex_of(&sha256(&expect)));
+    }
+
+    #[test]
+    fn audit_paths_verify_at_every_position_for_many_sizes() {
+        // Sizes both sides of several power-of-two boundaries (uneven sizes
+        // must not pad with empty or duplicated trailing records).
+        let sizes: Vec<usize> = (1..=18).chain([31, 32, 33, 63, 64, 65, 100, 127, 128, 129, 257]).collect();
+        for n in sizes {
+            let records: Vec<Vec<u8>> = (0..n).map(|i| format!("record-{i:04}").into_bytes()).collect();
+            let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+            let root = mth(&refs);
+            for m in 0..n {
+                let path = inclusion_path(&refs, m);
+                if n == 1 {
+                    assert!(path.is_empty(), "single record must have an empty path");
+                } else {
+                    // Path length is bounded by the tree depth; for an even
+                    // power-of-two batch every position sits at full depth.
+                    let depth = usize::BITS - (n - 1).leading_zeros();
+                    if n.is_power_of_two() {
+                        assert_eq!(path.len(), depth as usize, "n={n}, m={m}");
+                    } else {
+                        assert!(path.len() <= depth as usize, "n={n}, m={m}");
+                    }
+                }
+                let computed = verify_proof(refs[m], m, n, &path);
+                assert_eq!(hex_of(&computed), hex_of(&root), "proof mismatch at n={n}, m={m}");
+            }
+        }
+    }
+
+    #[test]
+    fn single_record_audit_path_is_empty_but_fields_still_present() {
+        let records = [b"only".as_slice()];
+        let path = inclusion_path(&records, 0);
+        assert!(path.is_empty());
+        let json = proof_json(1, 0, &mth(&records), &path);
+        assert_eq!(
+            json,
+            format!(
+                "{{\"tree_size\":1,\"leaf_index\":0,\"root\":\"{}\",\"audit_path\":[]}}",
+                hex_of(&mth(&records))
+            )
+        );
+    }
+
+    #[test]
+    fn duplicate_content_gets_distinct_position_specific_proofs() {
+        // Same bytes at positions 0 and 4 (like the regression batch): the
+        // proofs must anchor the exact requested position.
+        let refs: Vec<&[u8]> = vec![b"x", b"a", b"b", b"c", b"x", b"d", b"e"];
+        let n = refs.len();
+        let root = mth(&refs);
+        let p0 = inclusion_path(&refs, 0);
+        let p4 = inclusion_path(&refs, 4);
+        assert_ne!(p0, p4, "equal content at different positions needs different proofs");
+        assert_eq!(hex_of(&verify_proof(b"x", 0, n, &p0)), hex_of(&root));
+        assert_eq!(hex_of(&verify_proof(b"x", 4, n, &p4)), hex_of(&root));
+        // The proof for position 4 must not verify at position 0.
+        let wrong = verify_proof(b"x", 0, n, &p4);
+        assert_ne!(hex_of(&wrong), hex_of(&root));
+    }
+
+    #[test]
+    fn proof_for_uneven_batch_does_not_use_padded_tree() {
+        // n=5: RFC split k=4, so leaf 4 pairs directly with MTH of the whole
+        // size-4 subtree — a single sibling. A power-of-two padding scheme
+        // would pad to 8 and emit a three-element path instead.
+        let owned: Vec<Vec<u8>> = (0..5).map(|i| vec![b'a' + i as u8]).collect();
+        let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        let root = mth(&refs);
+        let path = inclusion_path(&refs, 4);
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0], mth(&refs[..4]), "the one sibling is MTH(d0..d3)");
+        assert_eq!(hex_of(&verify_proof(refs[4], 4, 5, &path)), hex_of(&root));
+    }
+
+    #[test]
+    fn index_parsing_accepts_only_ascii_unsigned_decimal() {
+        assert_eq!(parse_index("0"), Some(0));
+        assert_eq!(parse_index("00"), Some(0));
+        assert_eq!(parse_index("123"), Some(123));
+        assert_eq!(parse_index("18446744073709551615"), Some(u64::MAX));
+        assert_eq!(parse_index("18446744073709551616"), None);
+        assert_eq!(parse_index(""), None);
+        assert_eq!(parse_index("-1"), None);
+        assert_eq!(parse_index("+1"), None);
+        assert_eq!(parse_index("1.0"), None);
+        assert_eq!(parse_index(" 1"), None);
+        assert_eq!(parse_index("1 "), None);
+        assert_eq!(parse_index("0x1"), None);
+        assert_eq!(parse_index("①"), None);
+        // Leading-zero overflow is still overflow.
+        assert_eq!(parse_index("0018446744073709551616"), None);
     }
 }
