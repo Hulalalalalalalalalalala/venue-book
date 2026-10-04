@@ -15,129 +15,11 @@
 //! command execution failure from a root mismatch and report both the record
 //! sequence and the expected root.
 
-use std::fs;
-use std::path::PathBuf;
+mod common;
+
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_roottrace")
-}
-
-/// File that is deleted when the guard drops, even if the test panics.
-struct TempFile {
-    path: PathBuf,
-}
-
-impl TempFile {
-    fn create(data: &[u8]) -> Self {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "roottrace-regtest-{}-{}",
-            std::process::id(),
-            id,
-        ));
-        fs::write(&path, data).unwrap_or_else(|e| panic!("cannot create {}: {e}", path.display()));
-        TempFile { path }
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// Temporary directory (used to trigger "path is a directory" failures).
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn create() -> Self {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("roottrace-regtest-dir-{}-{}", std::process::id(), id));
-        fs::create_dir(&path).unwrap();
-        TempDir { path }
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
-    }
-}
-
-fn join_lf(records: &[&[u8]], trailing_lf: bool) -> Vec<u8> {
-    let mut data: Vec<u8> = Vec::new();
-    for (i, rec) in records.iter().enumerate() {
-        if i > 0 {
-            data.push(b'\n');
-        }
-        data.extend_from_slice(rec);
-    }
-    if trailing_lf && !records.is_empty() {
-        data.push(b'\n');
-    }
-    data
-}
-
-/// Run `roottrace root <file>` and fully verify the documented success path:
-/// exit status 0, empty stderr, stdout is exactly one line of 64 lowercase
-/// hex digits terminated by a single LF, equal to `expected`.
-fn assert_root(desc: &str, records: &[&[u8]], file_bytes: &[u8], expected: &str) {
-    let tmp = TempFile::create(file_bytes);
-    let output = Command::new(bin())
-        .arg("root")
-        .arg(&tmp.path)
-        .output()
-        .expect("failed to execute roottrace binary");
-
-    let sequence = records;
-    if !output.status.success() || output.status.code() != Some(0) {
-        panic!(
-            "[{desc}] command execution failed for record sequence {sequence:?}\n\
-             file bytes: {file_bytes:?}\n\
-             expected root: {expected}\n\
-             exit status: {:?}\n\
-             stderr: {}\n\
-             stdout: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout),
-        );
-    }
-    if !output.stderr.is_empty() {
-        panic!(
-            "[{desc}] successful run wrote to stderr for sequence {sequence:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let stdout = &output.stdout;
-    if stdout.len() != 65 || stdout[64] != b'\n' {
-        panic!(
-            "[{desc}] stdout is not exactly 64 hex digits + LF for sequence {sequence:?}: {stdout:?}"
-        );
-    }
-    let hex = &stdout[..64];
-    if !hex.iter().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
-        panic!("[{desc}] root must be lowercase hex, got: {:?}", std::str::from_utf8(hex));
-    }
-    let actual = std::str::from_utf8(hex).unwrap();
-    if actual != expected {
-        panic!(
-            "[{desc}] ROOT MISMATCH\n\
-             record sequence: {sequence:?}\n\
-             file bytes: {file_bytes:?}\n\
-             expected root: {expected}\n\
-             actual root:   {actual}"
-        );
-    }
-}
+use common::{assert_root, join_lf, TempDir, TempFile};
 
 // ---------------------------------------------------------------------------
 // Fixed record sequences.
@@ -355,7 +237,7 @@ fn empty_file_is_zero_records_single_lf_is_one_empty_record() {
 
 #[test]
 fn version_output_is_unchanged() {
-    let out = Command::new(bin()).arg("--version").output().unwrap();
+    let out = Command::new(common::bin()).arg("--version").output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty());
     assert_eq!(out.stdout, b"roottrace 0.1.0\n");
@@ -363,7 +245,7 @@ fn version_output_is_unchanged() {
 
 #[test]
 fn usage_errors_exit_2_and_write_usage_to_stderr() {
-    let no_args = Command::new(bin()).output().unwrap();
+    let no_args = Command::new(common::bin()).output().unwrap();
     assert_eq!(no_args.status.code(), Some(2));
     assert!(no_args.stdout.is_empty());
     let err = String::from_utf8_lossy(&no_args.stderr);
@@ -375,7 +257,7 @@ fn usage_errors_exit_2_and_write_usage_to_stderr() {
         vec!["root", "a", "b"],
         vec!["--version", "extra"],
     ] {
-        let out = Command::new(bin()).args(&args).output().unwrap();
+        let out = Command::new(common::bin()).args(&args).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "args {args:?} should exit 2");
         assert!(out.stdout.is_empty(), "args {args:?} must not write stdout");
         assert!(
@@ -390,7 +272,7 @@ fn read_failures_exit_1_and_write_nothing_to_stdout() {
     let missing = TempFile::create(b"x");
     let missing_path = missing.path.clone();
     drop(missing); // delete it so the path does not exist
-    let out = Command::new(bin())
+    let out = Command::new(common::bin())
         .arg("root")
         .arg(&missing_path)
         .output()
@@ -400,7 +282,7 @@ fn read_failures_exit_1_and_write_nothing_to_stdout() {
     assert!(!out.stderr.is_empty());
 
     let dir = TempDir::create();
-    let out = Command::new(bin()).arg("root").arg(&dir.path).output().unwrap();
+    let out = Command::new(common::bin()).arg("root").arg(&dir.path).output().unwrap();
     assert_eq!(out.status.code(), Some(1), "directory path should exit 1");
     assert!(out.stdout.is_empty());
     assert!(!out.stderr.is_empty());
