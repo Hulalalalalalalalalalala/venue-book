@@ -141,6 +141,10 @@ class CDP {
     });
   }
   on(fn) { this.eventListeners.push(fn); }
+  off(fn) {
+    const i = this.eventListeners.indexOf(fn);
+    if (i >= 0) this.eventListeners.splice(i, 1);
+  }
   send(method, params = {}) {
     const id = ++this.nextId;
     return new Promise((resolve, reject) => {
@@ -228,46 +232,73 @@ function createNetworkLog(cdp) {
 
 // ---- POST 挂起闸门（Fetch 域拦截）----
 
-// createPostGate 用 CDP 的 Fetch 域把发往 /api/venues 的 POST 暂停在“请求
-// 已经发出、响应尚未返回”的阶段，真实复现“点击保存后、结果返回前继续编辑
-// 表单”的等待窗口：pause() 之后遇到的下一个场地 POST 会被挂起，测试先在
-// 页面里完成编辑，再决定放行到真实服务端（pass）或直接合成响应（fulfill，
-// 例如 400），响应内容与到达时机完全由测试掌握。列表 GET 等其余请求一律
-// 立即放行，不改变页面与服务端的既有行为。
-function createPostGate(cdp) {
-  // held: id -> { id, requestId, url, body, done }
+// createFetchGate 用 CDP 的 Fetch 域把发往 /api/venues 的 POST/GET 暂停在
+// “请求已经发出、响应尚未返回”的阶段，真实复现两类等待窗口：
+//   - POST 挂起：点击保存后、结果返回前继续编辑表单（既有等待期编辑场景）；
+//   - GET 挂起：首页初次列表读取尚未结束时保存，保存触发的较新读取与较旧
+//     读取先后返回顺序由测试完全掌握（列表读取竞态回归场景）。
+// pause(method) 之后遇到的下一个匹配 method 的场地请求会被挂起，测试先在
+// 页面里完成操作，再决定放行到真实服务端（pass）、直接合成响应（fulfill /
+// fulfillText，例如 400、无法解析的 JSON）或让请求连接失败（fail）；响应
+// 内容与到达时机完全由测试掌握。不匹配的请求一律立即放行，不改变页面与
+// 服务端的既有行为。
+function createFetchGate(cdp) {
+  // held: id -> { id, requestId, url, method, body, done }
   const held = new Map();
   let seq = 0;
-  let paused = false;
+  // pausedMethods: 哪些 method 处于“下一个请求挂起”状态（一次性）。
+  const pausedMethods = new Set();
   let waiters = [];
+  // methodWaiters: 等待“下一个指定 method 请求被挂起”的回调。
+  const methodWaiters = new Map();
 
   cdp.on((method, params) => {
     if (method !== "Fetch.requestPaused") return;
     // 监听器内的异步失败（例如请求已失效）绝不能冒泡成 unhandledRejection，
     // 统一吞掉：挂起/放行失败只会让对应场景的断言失败。
     (async () => {
-      const isVenuePost = params.request && params.request.method === "POST" &&
-        params.request.url.includes("/api/venues");
-      if (!paused || !isVenuePost) {
+      const isVenueReq = params.request.url.includes("/api/venues");
+      const reqMethod = params.request.method;
+      if (!isVenueReq || !pausedMethods.has(reqMethod)) {
         try {
           await cdp.send("Fetch.continueRequest", { requestId: params.requestId });
         } catch { /* 请求可能已失效，忽略 */ }
         return;
       }
-      // 挂起时立即取回请求体原文：此时尚未放行，内容必然是点击保存那一刻的
-      // 快照，之后页面怎么改都影响不到它。
+      // 挂起时立即取回请求体原文：POST 此时尚未放行，内容必然是点击保存
+      // 那一刻的快照，之后页面怎么改都影响不到它。
       let body = null;
-      try {
-        const out = await cdp.send("Fetch.getRequestBody", { requestId: params.requestId });
-        body = out.base64Encoded ? Buffer.from(out.body, "base64").toString("utf8") : out.body;
-      } catch {
-        body = params.request.postData || null;
+      if (reqMethod === "POST") {
+        try {
+          const out = await cdp.send("Fetch.getRequestBody", { requestId: params.requestId });
+          body = out.base64Encoded ? Buffer.from(out.body, "base64").toString("utf8") : out.body;
+        } catch {
+          body = params.request.postData || null;
+        }
       }
+      // “下一个该 method 请求挂起”是一次性的：挂住后立即恢复对后续请求
+      // 放行，避免把保存成功后触发的 GET 等后续请求也挂住。
+      pausedMethods.delete(reqMethod);
       const id = ++seq;
-      held.set(id, { id, requestId: params.requestId, url: params.request.url, body, done: false });
+      held.set(id, {
+        id,
+        requestId: params.requestId,
+        // Fetch 域的 requestId（interception-job-*）与 Network 域的请求 id
+        // 不同；requestPaused 额外给出 networkId，监听网络事件时要用它关联。
+        networkId: params.networkId || params.requestId,
+        url: params.request.url,
+        method: reqMethod,
+        body,
+        done: false,
+      });
       const ws = waiters;
       waiters = [];
       for (const w of ws) w(id);
+      const mw = methodWaiters.get(reqMethod);
+      if (mw) {
+        methodWaiters.delete(reqMethod);
+        for (const w of mw) w(id);
+      }
     })().catch(() => { /* 竞态失败交给场景断言处理 */ });
   });
 
@@ -277,8 +308,8 @@ function createPostGate(cdp) {
         patterns: [{ urlPattern: "*api/venues*", requestStage: "Request" }],
       });
     },
-    pause() { paused = true; },
-    resume() { paused = false; },
+    pause(method = "POST") { pausedMethods.add(method); },
+    resume(method = "POST") { pausedMethods.delete(method); },
     nextHold(timeout = 8000) {
       for (const rec of held.values()) {
         if (!rec.done) return Promise.resolve(rec.id);
@@ -289,19 +320,39 @@ function createPostGate(cdp) {
         waiters.push((id) => { clearTimeout(timer); resolve(id); });
       });
     },
+    // nextHoldMethod 等待下一个被挂起的指定 method 请求（GET 竞态场景使用）。
+    // afterId 用于两次读取同时挂起时跳过更早被挂住的那一个。
+    nextHoldMethod(reqMethod, opts = {}) {
+      const afterId = opts.afterId || 0;
+      const timeout = opts.timeout || 8000;
+      for (const rec of held.values()) {
+        if (!rec.done && rec.method === reqMethod && rec.id > afterId) return Promise.resolve(rec.id);
+      }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`等待 ${reqMethod} /api/venues 被挂起超时`)), timeout);
+        const list = methodWaiters.get(reqMethod) || [];
+        list.push((id) => {
+          if (id <= afterId) return; // 理论上不会发生（新 id 恒更大），保险起见忽略
+          clearTimeout(timer);
+          resolve(id);
+        });
+        methodWaiters.set(reqMethod, list);
+      });
+    },
     bodyOf(id) {
       const rec = held.get(id);
       return rec ? rec.body : null;
     },
-    // pass 放行到真实服务端，由真实处理链给出 201/400。
+    // pass 放行到真实服务端，由真实处理链给出响应。
     async pass(id) {
       const rec = held.get(id);
       if (!rec || rec.done) return;
       rec.done = true;
       await cdp.send("Fetch.continueRequest", { requestId: rec.requestId });
     },
-    // fulfill 不接触真实服务端，直接合成一个响应，保证“失败提交”不可能在
-    // 服务端落地。
+    // fulfill 不接触真实服务端，直接合成一个 JSON 响应；对 POST 可合成
+    // 400 保证“失败提交”不可能在服务端落地，对 GET 可合成 HTTP 错误。
     async fulfill(id, status, payload) {
       const rec = held.get(id);
       if (!rec || rec.done) return;
@@ -317,6 +368,32 @@ function createPostGate(cdp) {
         body: Buffer.from(raw, "utf8").toString("base64"),
       });
     },
+    // fulfillText 合成任意文本响应（Content-Type 仍声明 JSON），用于让较新
+    // 或较旧读取拿到“HTTP 200 但响应不是有效 JSON”的结果。
+    async fulfillText(id, status, text) {
+      const rec = held.get(id);
+      if (!rec || rec.done) return;
+      rec.done = true;
+      const raw = String(text);
+      await cdp.send("Fetch.fulfillRequest", {
+        requestId: rec.requestId,
+        responseCode: status,
+        responseHeaders: [
+          { name: "Content-Type", value: "application/json; charset=utf-8" },
+          { name: "Content-Length", value: String(Buffer.byteLength(raw)) },
+        ],
+        body: Buffer.from(raw, "utf8").toString("base64"),
+      });
+    },
+    // fail 让请求在网络层失败（连接失败）：不返回任何 HTTP 响应。
+    async fail(id, reason = "Failed") {
+      const rec = held.get(id);
+      if (!rec || rec.done) return;
+      rec.done = true;
+      try {
+        await cdp.send("Fetch.failRequest", { requestId: rec.requestId, errorReason: reason });
+      } catch { /* 请求可能已失效，忽略 */ }
+    },
     // continueAll 放行所有仍挂着的请求：场景中断时自愈，避免遗留 fetch 永久
     // 挂起影响后续场景。
     async continueAll() {
@@ -328,6 +405,13 @@ function createPostGate(cdp) {
           } catch { /* ignore */ }
         }
       }
+    },
+    // networkIdOf 返回闸门记录对应的 Network 域请求 id（Fetch 拦截 id 与
+    // Network 事件 id 不同，需用 requestPaused.networkId 关联），供网络记录
+    // 精确等待“这条被挂起的请求已真正交付/失败”。
+    networkIdOf(id) {
+      const rec = held.get(id);
+      return rec ? rec.networkId : null;
     },
   };
 }
@@ -575,9 +659,9 @@ async function main() {
 
     const net = createNetworkLog(cdp);
 
-    // POST 挂起闸门：默认不拦截（请求一律立即放行），仅在“等待期编辑”场景
-    // 中临时 pause，把下一个场地 POST 挂在响应返回之前。
-    const gate = createPostGate(cdp);
+    // Fetch 闸门：默认不拦截（请求一律立即放行）；POST 场景临时 pause() 挂住
+    // 下一个场地 POST，列表读取竞态场景用 pause("GET") 挂住指定的列表 GET。
+    const gate = createFetchGate(cdp);
     await gate.enable();
 
     const navigate = async () => {
@@ -1585,6 +1669,452 @@ async function main() {
         await gate.continueAll();
         bad(S, "场景执行中断: " + e.message, e.stack);
       }
+    }
+
+    // ===== 列表读取先后返回（读取竞态）回归场景 =====
+    //
+    // 首页打开时会读取一次场地列表；新增场地保存成功后又会读取一次。页面按
+    // 读取的“发起顺序”处理响应：只有最近发起的读取能更新列表，更早读取随后
+    // 成功（含空数组）或失败（HTTP 错误、无法解析的 JSON、连接失败）都必须
+    // 被丢弃。下列场景完全经由现有首页操作触发竞态——初次 GET 在页面加载
+    // 时被挂起，用户在它返回前用现有表单填写合法场地并点击现有“保存”，
+    // POST 与保存触发的较新 GET 由真实服务端处理，两次读取的返回内容与先后
+    // 顺序由闸门精确控制，断言对象始终是页面最终可见的卡片、空提示或错误。
+
+    // waitRequestSettled：等待“这一条被闸门挂起的请求”在浏览器侧真正收到
+    // 响应（Network.responseReceived）或被判定网络失败
+    // （Network.loadingFailed），再补一拍等页面渲染。fulfillRequest/
+    // failRequest 返回只代表 Chrome 接受了指令，响应到达页面是异步事件，
+    // 用固定 sleep 等待会在机器慢时产生“页面还没渲染就断言”的抖动；按
+    // Network 域请求 id（Fetch.requestPaused 的 networkId）监听该请求的
+    // 网络事件，能把交付时机确定下来。
+    const waitRequestSettled = (gateId) => new Promise((resolve) => {
+      const requestId = gate.networkIdOf(gateId);
+      let done = false;
+      let timer;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        cdp.off(onEvent);
+        sleep(120).then(resolve);
+      };
+      const onEvent = (method, params) => {
+        if (!params || params.requestId !== requestId) return;
+        if (method === "Network.responseReceived" || method === "Network.loadingFailed") {
+          finish();
+        }
+      };
+      cdp.on(onEvent);
+      // 兜底：极端情况下事件错过时不永久挂起，交给场景断言暴露问题。
+      timer = setTimeout(finish, 4000);
+    });
+
+    // disposeAndWait：先登记“该请求已交付/失败”的监听，再执行处置
+    // （pass/fulfill/fail），最后等浏览器真正收到结果，避免处置与监听之间
+    // 的竞态漏掉网络事件。
+    const disposeAndWait = async (gateId, action) => {
+      const delivered = waitRequestSettled(gateId);
+      await action(gateId);
+      await delivered;
+    };
+
+    // expectCardsShow 断言列表区域当前是“场地卡片视图”：present 中每个场地
+    // 都在场且容量/时区/时段内容来自对应那次读取，absentNames 中任何名字都
+    // 不出现；同时不出现空提示/加载提示/读取失败提示。不要求卡片总数恰好
+    // 等于 present 数量——较新读取走真实服务端时会携带此前各场景保存的场地，
+    // 它们本来就该继续显示。
+    const expectCardsShow = async (S, label, present, absentNames) => {
+      const s = await state();
+      check(S, label + "列表为场地卡片视图而非空/错误/加载提示",
+        s.cards.length >= present.length &&
+          s.listText.indexOf("还没有场地记录") === -1 &&
+          s.listText.indexOf("正在加载") === -1,
+        `list=${s.listText}`);
+      present.forEach((v) => {
+        const card = findCard(s.cards, v.name);
+        check(S, label + "存在场地卡片「" + v.name + "」", !!card,
+          JSON.stringify(s.cards.map((c) => c.name)));
+        if (!card) return;
+        check(S, label + "「" + v.name + "」卡片容量来自较新读取",
+          capacityOnCard(card) === String(v.capacity), card.text);
+        check(S, label + "「" + v.name + "」卡片时区来自较新读取",
+          card.tz === "时区：" + v.timezone, card.tz);
+        if (v.hours !== undefined) {
+          const wantChips = expectedChips(v.hours);
+          check(S, label + "「" + v.name + "」卡片开放时段来自较新读取",
+            card.chips.length >= wantChips.length &&
+              wantChips.every((t) => card.chips.indexOf(t) >= 0),
+            JSON.stringify({ got: card.chips, want: wantChips }));
+        }
+      });
+      (absentNames || []).forEach((n) => {
+        check(S, label + "不显示仅存在于较旧响应中的「" + n + "」",
+          !findCard(s.cards, n), JSON.stringify(s.cards.map((c) => c.name)));
+      });
+      return s;
+    };
+
+    // expectEmptyHint：当前有效读取成功返回空数组时应展示原有的无场地提示。
+    const expectEmptyHint = async (S, label) => {
+      const s = await state();
+      check(S, label + "显示“还没有场地记录”空提示",
+        s.cards.length === 0 && s.listText.indexOf("还没有场地记录") >= 0,
+        `list=${s.listText}`);
+      check(S, label + "不显示加载或读取失败提示",
+        s.listText.indexOf("正在加载") === -1 &&
+          s.listText.indexOf("读取场地列表失败") === -1,
+        `list=${s.listText}`);
+      return s;
+    };
+
+    // expectListError：列表区域展示读取失败原因。HTTP 错误/无效 JSON 的原因
+    // 带“读取场地列表失败”前缀；连接失败时页面直接显示浏览器给出的原文
+    // （如 Failed to fetch），因此这里统一按“无卡片、无空提示、无加载提示、
+    // 文本非空”识别失败状态，再用 fragment 精确核对原因片段。
+    const expectListError = async (S, label, fragment) => {
+      const s = await state();
+      const isErrorState = s.cards.length === 0 &&
+        s.listText.indexOf("还没有场地记录") === -1 &&
+        s.listText.indexOf("正在加载") === -1 &&
+        s.listText.trim() !== "";
+      check(S, label + "列表显示读取失败提示（无卡片/空提示/加载提示）",
+        isErrorState, `list=${s.listText}`);
+      if (fragment) {
+        check(S, label + "失败原因包含：" + fragment,
+          s.listText.indexOf(fragment) >= 0, `list=${s.listText}`);
+      }
+      return s;
+    };
+
+    // expectListTextStable：连续两次读取列表文本完全一致，用来证明迟到响应
+    // 没有在任何一个微任务时点改写界面。
+    const expectListTextStable = async (S, label) => {
+      const a = (await state()).listText;
+      await sleep(150);
+      const b = (await state()).listText;
+      check(S, label, a === b && a.indexOf("正在加载") === -1, `a=${a} b=${b}`);
+      return a;
+    };
+
+    // startFreshWithHeldInitialGet：重新加载首页并让初次列表读取挂起，在它
+    // 返回前用现有表单填写 venue 并点击现有“保存”。POST 与保存成功触发的
+    // 较新 GET 都由真实服务端处理并正常返回（较新 GET 立即完成，因此页面
+    // 先显示真实保存结果），初次 GET 仍挂起等待场景控制。返回两个读取的
+    // 闸门 id 与真实 POST 记录。
+    const startFreshWithHeldInitialGet = async (venue) => {
+      const getsAtStart = net.venueGets().length;
+      gate.pause("GET");
+      await cdp.send("Page.navigate", { url: baseURL + "/" });
+      const olderId = await gate.nextHoldMethod("GET");
+      // 初次读取未返回：页面仍是“正在加载…”。
+      await poll(async () => {
+        const t = await cdp.eval(`document.getElementById("venue-list").textContent`);
+        return t && t.indexOf("正在加载") >= 0;
+      }, { timeout: 4000, label: "初次读取挂起中的加载提示" });
+      await fill(venue);
+      const postsBefore = net.venuePosts().length;
+      await submit();
+      const post = await poll(async () => {
+        const got = net.venuePosts(postsBefore);
+        return got.length ? got[got.length - 1] : null;
+      }, { timeout: 8000, label: "保存 POST 发出" });
+      // POST 由真实服务端处理，等待 201；其成功后触发的较新 GET 不被拦截
+      // （一次性 pause 已被初次 GET 消费），正常返回包含新场地的列表。
+      await poll(async () => post.status === 201 ? post : null,
+        { timeout: 8000, label: "保存 POST 返回 201" });
+      // 等待较新 GET 发出（真实服务端，立即返回）：它是本次导航之后的第二
+      // 个列表读取（不能用累计总数判断，网络记录保留了此前各场景的请求）。
+      const newerGet = await poll(async () => {
+        const got = net.venueGets().slice(getsAtStart);
+        return got.length >= 2 ? got[got.length - 1] : null;
+      }, { timeout: 8000, label: "保存触发较新读取" });
+      // 等待较新读取真实渲染出本次保存的卡片（而不是固定睡眠），避免机器
+      // 较慢时在页面渲染前就断言。
+      await poll(async () => findCard((await state()).cards, venue.name) ? true : null,
+        { timeout: 8000, label: "较新读取渲染新场地卡片" });
+      return { olderId, newerGet, post };
+    };
+
+    // venuesJSON：构造列表接口风格的响应文本。
+    const venuesJSON = (venues) => JSON.stringify({ venues });
+
+    // ---------- 场景 17：无交错读取时，正常返回的列表照常显示 ----------
+    {
+      const S = "读取竞态·无交错正常显示";
+      try {
+        // 此刻服务端已有前面场景保存的多个场地；重新加载让唯一一次读取
+        // 正常走真实服务端，列表应照常显示已保存场地且无错误。
+        const beforeNames = (await state()).cards.map((c) => c.name);
+        await navigate();
+        const s = await state();
+        check(S, "无交错读取后显示已有场地卡片",
+          s.cards.length === beforeNames.length &&
+            beforeNames.every((n) => s.cards.some((c) => c.name === n)),
+          JSON.stringify({ before: beforeNames, after: s.cards.map((c) => c.name) }));
+        check(S, "无交错读取不显示空/错误/加载提示",
+          s.listText.indexOf("还没有场地记录") === -1 &&
+            s.listText.indexOf("读取场地列表失败") === -1 &&
+            s.listText.indexOf("正在加载") === -1,
+          `list=${s.listText}`);
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 18：当前有效读取返回空数组，仍显示原有无场地提示 ----------
+    // 经由首页现有表单保存引发列表刷新：初次读取挂起时保存第一个合法场地，
+    // 保存触发的较新读取真实返回并显示卡片；随后再用现有表单保存第二个合法
+    // 场地，把这次保存引发的“当前有效读取”（最近发起）挂起并让它成功返回
+    // 空数组——页面必须显示原有的“还没有场地记录”。最后放行仍在途的初次
+    // 读取，空提示也不能被更旧结果覆盖。
+    {
+      const S = "读取竞态·当前有效读取为空";
+      const first = { name: "空结果前先保存馆", capacity: "35", timezone: "Asia/Shanghai", hours: [] };
+      const second = { name: "空结果触发器", capacity: "9", timezone: "UTC", hours: [] };
+      try {
+        const { olderId } = await startFreshWithHeldInitialGet(first);
+        let s = await state();
+        check(S, "第一次保存后较新读取已显示其卡片",
+          !!findCard(s.cards, first.name), JSON.stringify(s.cards.map((c) => c.name)));
+
+        // 第二次保存：挂住它触发的列表刷新（此时初次读取仍挂着）。
+        await fill(second);
+        gate.pause("GET");
+        const postsBefore = net.venuePosts().length;
+        await submit();
+        await poll(async () => net.venuePosts(postsBefore).length ? true : null,
+          { timeout: 8000, label: "第二次保存 POST 发出" });
+        const emptyGetId = await gate.nextHoldMethod("GET", { afterId: olderId });
+        await poll(async () => {
+          const posts = net.venuePosts();
+          const last = posts[posts.length - 1];
+          return last && last.status === 201 ? last : null;
+        }, { timeout: 8000, label: "第二次保存返回 201" });
+        // 当前有效读取成功返回空数组：显示原有的无场地提示。
+        await disposeAndWait(emptyGetId, (id) => gate.fulfillText(id, 200, venuesJSON([])));
+        await expectEmptyHint(S, "当前有效读取返回空数组后");
+
+        // 仍在途的初次（更旧）读取随后成功返回含场地的保存前列表，也不能
+        // 追加卡片或替换空提示。
+        const staleVenues = [{
+          id: "stale-before-empty", name: "空提示后旧读里的旧馆", capacity: 11,
+          timezone: "UTC", weeklyHours: [],
+        }];
+        await disposeAndWait(olderId, (id) => gate.fulfillText(id, 200, venuesJSON(staleVenues)));
+        await expectEmptyHint(S, "更旧读取迟到返回旧列表后");
+        s = await state();
+        check(S, "不把更旧响应里的场地追加进列表",
+          !findCard(s.cards, "空提示后旧读里的旧馆"),
+          JSON.stringify(s.cards.map((c) => c.name)));
+        await expectListTextStable(S, "空提示在更旧读取迟到后保持稳定");
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 19：较新读取先显示新场地，旧读取随后成功返回保存前列表 ----------
+    {
+      const S = "读取竞态·旧读迟到返回旧列表";
+      const venue = {
+        name: "竞态旧列表馆", capacity: "128", timezone: "Asia/Tokyo",
+        hours: [{ weekday: 2, start: "10:00", end: "12:30" }],
+      };
+      try {
+        const { olderId, newerGet } = await startFreshWithHeldInitialGet(venue);
+        const newerBody = await net.bodyOf(newerGet);
+        let newerVenues = null;
+        try { newerVenues = JSON.parse(newerBody).venues; } catch { /* ignore */ }
+        await expectCardsShow(S, "较新读取先返回后", [
+          { name: venue.name, capacity: venue.capacity, timezone: venue.timezone, hours: venue.hours },
+        ]);
+        check(S, "较新读取的完整列表确实包含新场地",
+          Array.isArray(newerVenues) && newerVenues.some((v) => v.name === venue.name),
+          newerBody);
+
+        // 初次（较旧）读取随后返回“保存之前”的列表：放行到真实服务端拿到
+        // 的可能已含新场地，无法保证是“保存前列表”，因此合成一份保存前列
+        // 表：包含一条较新结果里不存在的旧场地、且不含新场地，专门验证旧
+        // 记录不会被追加进来、页面以较新读取的完整列表为准。
+        const staleName = "仅旧读取里的旧馆";
+        const staleVenues = [{
+          id: "stale-old-only", name: staleName, capacity: 11,
+          timezone: "UTC", weeklyHours: [],
+        }];
+        await disposeAndWait(olderId, (id) => gate.fulfillText(id, 200, venuesJSON(staleVenues)));
+        const s = await expectCardsShow(S, "旧读取迟到返回旧列表后", [
+          { name: venue.name, capacity: venue.capacity, timezone: venue.timezone, hours: venue.hours },
+        ], [staleName]);
+        check(S, "新场地不消失、不变成空提示",
+          !!findCard(s.cards, venue.name), s.listText);
+        await expectListTextStable(S, "旧读取迟到后显示不再变化");
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 20：较新读取先显示新场地，旧读取随后返回空数组 ----------
+    {
+      const S = "读取竞态·旧读迟到返回空数组";
+      const venue = {
+        name: "竞态旧空馆", capacity: "72", timezone: "Europe/Paris",
+        hours: [{ weekday: 1, start: "22:00", end: "02:00" }],
+      };
+      try {
+        const { olderId } = await startFreshWithHeldInitialGet(venue);
+        await expectCardsShow(S, "较新读取先返回后", [
+          { name: venue.name, capacity: venue.capacity, timezone: venue.timezone, hours: venue.hours },
+        ]);
+        // 较旧读取随后返回空数组：绝不能清掉卡片、改成“还没有场地记录”。
+        await disposeAndWait(olderId, (id) => gate.fulfillText(id, 200, venuesJSON([])));
+        const s = await state();
+        check(S, "旧读取空数组后新场地卡片仍在",
+          s.cards.length >= 1 && !!findCard(s.cards, venue.name),
+          `list=${s.listText}`);
+        check(S, "旧读取空数组后不显示“还没有场地记录”",
+          s.listText.indexOf("还没有场地记录") === -1, `list=${s.listText}`);
+        check(S, "卡片仍显示较新读取的容量/时区/时段",
+          (() => {
+            const c = findCard(s.cards, venue.name);
+            if (!c) return false;
+            const wantChips = expectedChips(venue.hours);
+            return capacityOnCard(c) === venue.capacity &&
+              c.tz === "时区：" + venue.timezone &&
+              c.chips.length === wantChips.length &&
+              wantChips.every((t, i) => c.chips[i] === t);
+          })(),
+          JSON.stringify(findCard(s.cards, venue.name)));
+        await expectListTextStable(S, "旧读取空数组后显示不再变化");
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 21：较新读取先显示新场地，旧读取随后以三种方式失败 ----------
+    for (const failure of [
+      { kind: "HTTP 错误", apply: (id) => gate.fulfillText(id, 500, JSON.stringify({ error: "boom" })), fragment: "HTTP 500" },
+      { kind: "无法解析的 JSON", apply: (id) => gate.fulfillText(id, 200, "这不是JSON{,"), fragment: "不是有效的 JSON" },
+      { kind: "连接失败", apply: (id) => gate.fail(id, "Failed"), fragment: null },
+    ]) {
+      const S = "读取竞态·旧读迟到失败（" + failure.kind + "）";
+      const venue = { name: "旧读失败馆·" + failure.kind, capacity: "46", timezone: "UTC", hours: [] };
+      try {
+        const { olderId } = await startFreshWithHeldInitialGet(venue);
+        await expectCardsShow(S, "较新读取先返回后", [
+          { name: venue.name, capacity: venue.capacity, timezone: venue.timezone, hours: [] },
+        ]);
+        await disposeAndWait(olderId, (id) => failure.apply(id));
+        const s = await state();
+        check(S, "旧读取" + failure.kind + "后卡片不被换成失败提示",
+          !!findCard(s.cards, venue.name) &&
+            s.listText.indexOf("读取场地列表失败") === -1,
+          `list=${s.listText}`);
+        check(S, "旧读取" + failure.kind + "后不出现空提示",
+          s.listText.indexOf("还没有场地记录") === -1, `list=${s.listText}`);
+        await expectListTextStable(S, "旧读取" + failure.kind + "后显示不再变化");
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    }
+
+    // ---------- 场景 22：较新读取失败并已显示原因，旧读取随后成功/失败都不能遮错 ----------
+    // 流程：挂住初次（旧）读取；填表保存；把保存触发的较新读取也挂住（两次
+    // 读取同时在途）；先让较新读取以指定方式失败并确认页面显示其原因；再让
+    // 较旧读取成功返回非空列表、成功返回空数组，或以自己的方式失败，断言
+    // 列表始终只显示较新读取的原因、且原因文本不被替换。
+    const runNewerFailsScenario = async (newerFailure, olderOutcome, label) => {
+      const S = "读取竞态·新读失败后旧读" + label;
+      const venue = {
+        name: "新读失败馆·" + newerFailure.kind + "·" + label,
+        capacity: "53", timezone: "Asia/Shanghai",
+        hours: [{ weekday: 3, start: "09:00", end: "18:00" }],
+      };
+      try {
+        gate.pause("GET");
+        await cdp.send("Page.navigate", { url: baseURL + "/" });
+        const olderId = await gate.nextHoldMethod("GET");
+        await fill(venue);
+        // 保存 POST 走真实服务端；保存成功会立刻发起较新读取，把它也挂住：
+        // 在点击保存前再次 pause("GET")（第一次 pause 已被初次读取消费）。
+        gate.pause("GET");
+        const postsBefore = net.venuePosts().length;
+        await submit();
+        await poll(async () => net.venuePosts(postsBefore).length ? true : null,
+          { timeout: 8000, label: "保存 POST 发出" });
+        await poll(async () => {
+          const posts = net.venuePosts();
+          const last = posts[posts.length - 1];
+          return last && last.status === 201 ? last : null;
+        }, { timeout: 8000, label: "保存 POST 返回 201" });
+        const newerId = await gate.nextHoldMethod("GET", { afterId: olderId });
+        check(S, "两次读取同时在途且为不同请求", newerId > olderId,
+          `older=${olderId} newer=${newerId}`);
+
+        // 较新读取先失败，页面显示它的原因。
+        await disposeAndWait(newerId, (id) => newerFailure.apply(id));
+        const errState = await expectListError(S, "较新读取失败后", newerFailure.fragment);
+        const newerErrorText = errState.listText;
+
+        // 较旧读取随后返回。
+        let olderAction;
+        if (olderOutcome.type === "list") {
+          const staleVenues = [{
+            id: "stale-after-newer-error", name: "错误后旧读里的旧馆", capacity: 8,
+            timezone: "UTC", weeklyHours: [],
+          }];
+          olderAction = (id) => gate.fulfillText(id, 200, venuesJSON(staleVenues));
+        } else if (olderOutcome.type === "empty") {
+          olderAction = (id) => gate.fulfillText(id, 200, venuesJSON([]));
+        } else {
+          olderAction = (id) => olderOutcome.apply(id);
+        }
+        await disposeAndWait(olderId, olderAction);
+        const s = await state();
+        // 较新失败是连接失败时，页面显示的是浏览器原文（如 Failed to
+        // fetch）而不带“读取场地列表失败”前缀，因此这里只严格比较文本与
+        // 较新失败时完全一致，并核对无卡片/空提示。
+        check(S, "旧读取" + label + "后仍只显示较新读取的失败原因",
+          s.cards.length === 0 &&
+            s.listText.trim() !== "" &&
+            s.listText === newerErrorText,
+          `now=${s.listText} newerWas=${newerErrorText}`);
+        check(S, "旧读取" + label + "后不出现场地卡片或空提示",
+          s.listText.indexOf("还没有场地记录") === -1 &&
+            s.listText.indexOf("错误后旧读里的旧馆") === -1,
+          `list=${s.listText}`);
+        await expectListTextStable(S, "旧读取" + label + "后错误保持稳定");
+
+        // 保存成功后的表单清空规则不受列表读取失败影响：无等待期编辑时
+        // 表单应已清空。
+        check(S, "保存本身成功，表单按既有规则清空",
+          s.form.name === "" && s.form.capacity === "" && s.form.timezone === "" &&
+            s.form.hours.length === 0,
+          JSON.stringify(s.form));
+      } catch (e) {
+        await gate.continueAll();
+        bad(S, "场景执行中断: " + e.message, e.stack);
+      }
+    };
+
+    const newerFailures = [
+      { kind: "HTTP错误", apply: (id) => gate.fulfillText(id, 503, JSON.stringify({ error: "x" })), fragment: "HTTP 503" },
+      { kind: "无效JSON", apply: (id) => gate.fulfillText(id, 200, "<<<not json>>>"), fragment: "不是有效的 JSON" },
+      { kind: "连接失败", apply: (id) => gate.fail(id, "Failed"), fragment: null },
+    ];
+    // 对每一种较新失败，覆盖较旧读取随后：成功返回列表、成功返回空数组、
+    // 以另一种 HTTP 错误失败（502，原因文本与较新失败不同，专门检测较旧
+    // 失败不能用自己的原因替换较新失败已显示的原因）。
+    for (const nf of newerFailures) {
+      await runNewerFailsScenario(nf, { type: "list" }, "成功返回列表");
+      await runNewerFailsScenario(nf, { type: "empty" }, "成功返回空数组");
+      await runNewerFailsScenario(nf,
+        { type: "fail", apply: (id) => gate.fulfillText(id, 502, JSON.stringify({ error: "y" })) },
+        "也失败（原因不同）");
     }
 
     check("浏览器", "交互过程无页面脚本异常", pageErrors.length === 0,

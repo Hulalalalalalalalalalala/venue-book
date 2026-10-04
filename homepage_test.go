@@ -80,7 +80,7 @@ func TestHomepageCapacityBrowserE2E(t *testing.T) {
 	defer srv.Close()
 
 	harness := filepath.Join("testdata", "homepage_browser_test.mjs")
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, nodeBin, harness, srv.URL, chromeBin)
 	var stdout, stderr strings.Builder
