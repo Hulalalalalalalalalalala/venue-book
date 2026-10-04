@@ -121,6 +121,47 @@ assert len(V_DROP_EMPTY) == 8 and V_DROP_EMPTY != BASE8
 V_DUP_INSERT = BASE9 + [BASE9[0]]
 assert len(V_DUP_INSERT) == 10
 
+# ---------------------------------------------------------------------------
+# Long records straddling SHA-256 padding and block boundaries. The leaf
+# input is 0x00 || record, so record lengths 54/55/56 put the leaf input at
+# 55/56/57 bytes (the 56-byte padding boundary, where the 0x80 marker and
+# 8-byte length field stop fitting in one block) and 63/64/65 put it at
+# 64/65/66 bytes (the 64-byte block boundary). L146's leaf input spans
+# three blocks and still has real content at its very end.
+#
+# NUL, non-UTF-8 and CR bytes appear inside the records and at their very
+# ends; every byte is content. No record may contain LF (the separator).
+# ---------------------------------------------------------------------------
+L54 = b"boundary-54:" + b"a" * 38 + b"\x00\xff\xfe\r"      # ends with CR
+L55 = b"boundary-55:" + b"b" * 39 + b"\x00\xff\xfe\r"      # ends with CR
+L56 = b"boundary-56:" + b"c" * 40 + b"\xff\xfe\r\x00"      # ends with NUL
+L63 = b"boundary-63:" + b"d" * 47 + b"\x00\xff\xfe\r"      # ends with CR
+L64 = b"boundary-64:" + b"e" * 48 + b"\x00\xff\xfe\r"      # ends with CR
+L65 = b"boundary-65:" + b"f" * 49 + b"\xff\xfe\r\x00"      # ends with NUL
+L146 = (b"long-record-146:" + b"0123456789abcdef" * 7
+        + b"\x00\xff\xfe\r" + b"TAIL-MARKER-\x00\xff")     # real content at end
+LONG_RECORDS = [("L54", L54), ("L55", L55), ("L56", L56),
+                ("L63", L63), ("L64", L64), ("L65", L65),
+                ("L146", L146)]
+assert [len(r) for _, r in LONG_RECORDS] == [54, 55, 56, 63, 64, 65, len(L146)]
+assert len(L146) > 128
+for name, rec in LONG_RECORDS:
+    assert b"\n" not in rec, f"{name} must not contain the LF separator"
+    assert b"\x00" in rec and b"\xff" in rec and b"\r" in rec
+
+# Variant E: the SAME long record as L146 with ONE byte near the end changed
+# (second-to-last). The root must reflect the full record including its
+# tail; an implementation that only hashes a prefix cannot produce it.
+V_TAIL = L146[:-2] + b"\x01" + L146[-1:]
+assert len(V_TAIL) == len(L146) and V_TAIL != L146
+assert V_TAIL[:-2] == L146[:-2] and V_TAIL[-1:] == L146[-1:]
+
+# Fixed batch mixing long and short records: in a batch the long records
+# must be hashed by the same standard as when each is the only record.
+MIXED = [b"alpha", L54, b"", L65, b"delta\r", L146,
+         b"\xff\xfe\x00binary", L56]
+assert len(MIXED) == 8
+
 
 def join_lf(records, trailing=True):
     data = b"\n".join(records)
@@ -137,6 +178,15 @@ BATCHES = [
     ("V_SWAP", join_lf(V_SWAP), "B9 with r1 and r5 (different content) swapped", True),
     ("V_DROP_EMPTY", join_lf(V_DROP_EMPTY), "B9 with the empty record r2 omitted (8 records, != B8)", True),
     ("V_DUP_INSERT", join_lf(V_DUP_INSERT), "B9 plus one extra duplicate of r0 (10 records)", True),
+    ("L54", join_lf([L54]), "single 54-byte record (leaf input 55 bytes, padding boundary)", True),
+    ("L55", join_lf([L55]), "single 55-byte record (leaf input 56 bytes, padding boundary)", True),
+    ("L56", join_lf([L56]), "single 56-byte record (leaf input 57 bytes, padding boundary)", True),
+    ("L63", join_lf([L63]), "single 63-byte record (leaf input 64 bytes, block boundary)", True),
+    ("L64", join_lf([L64]), "single 64-byte record (leaf input 65 bytes, block boundary)", True),
+    ("L65", join_lf([L65]), "single 65-byte record (leaf input 66 bytes, block boundary)", True),
+    ("L146", join_lf([L146]), "single 146-byte record (leaf input spans three blocks)", True),
+    ("V_TAIL", join_lf([V_TAIL]), "L146 with one byte near the end changed", True),
+    ("MIXED", join_lf(MIXED), "long and short records in one 8-record batch", True),
     ("EMPTY", b"", "empty file: zero records", False),
     ("ONE_LF", b"\n", "single LF: one empty record", False),
 ]
@@ -188,7 +238,9 @@ def main():
     for recs, tag in [(BASE7, "B7"), (BASE8, "B8"), (BASE9, "B9"),
                       (V_DUP, "V_DUP"), (V_SWAP, "V_SWAP"),
                       (V_DROP_EMPTY, "V_DROP_EMPTY"),
-                      (V_DUP_INSERT, "V_DUP_INSERT")]:
+                      (V_DUP_INSERT, "V_DUP_INSERT"),
+                      (MIXED, "MIXED")] + \
+                     [([rec], name) for name, rec in LONG_RECORDS]:
         a, _ = root_of_file_bytes(join_lf(recs, trailing=True))
         b, _ = root_of_file_bytes(join_lf(recs, trailing=False))
         assert a == b
@@ -206,6 +258,20 @@ def main():
     assert roots["V_DUP_INSERT"] != roots["B9"]
     assert roots["EMPTY"] != roots["ONE_LF"]
     assert roots["EMPTY"] == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    # Long records: every length has its own root, the near-end single-byte
+    # change gives a different root from the unmodified long record, and the
+    # mixed batch collides with none of them.
+    long_names = [name for name, _ in LONG_RECORDS]
+    assert len({roots[n] for n in long_names}) == len(long_names)
+    assert roots["V_TAIL"] != roots["L146"]
+    assert roots["MIXED"] not in {roots[n] for n in long_names}
+
+    # Rust literals for the long records themselves (the Rust tests rebuild
+    # the batches from these exact bytes).
+    print("# Rust long-record literals:")
+    for name, rec in LONG_RECORDS + [("V_TAIL", V_TAIL)]:
+        print(f"const REC_{name}: &[u8] = {rust_byte_string(rec)};")
+    print()
 
     # Payload literal used by the Rust tests to materialise the batches.
     print("# Rust file payloads:")

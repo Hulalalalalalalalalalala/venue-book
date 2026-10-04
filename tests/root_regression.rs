@@ -1,6 +1,7 @@
 //! End-to-end regression tests for `roottrace root`, focused on the power-of
 //! two boundary in the RFC 6962 SHA-256 Merkle Tree Hash (7, 8 and 9
-//! records).
+//! records) and on long records straddling the SHA-256 padding and block
+//! boundaries (54/55/56, 63/64/65 and 146 raw bytes).
 //!
 //! Expected roots are FIXED constants produced independently of roottrace by
 //! `tests/reference/rfc6962_vectors.py`, which computes them with Python's
@@ -254,6 +255,66 @@ const ROOT_EMPTY_FILE: &str =
 const ROOT_ONE_EMPTY_RECORD: &str =
     "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d";
 
+// ---------------------------------------------------------------------------
+// Long records straddling SHA-256 padding and block boundaries.
+//
+// The leaf input is 0x00 || record, so record lengths 54/55/56 put the leaf
+// input at 55/56/57 bytes (the padding boundary: the 0x80 marker plus the
+// 8-byte length field stop fitting in the first block) and 63/64/65 put it
+// at 64/65/66 bytes (the block boundary). REC_L146's 147-byte leaf input
+// spans three blocks and still has real content at its very end. Every
+// record embeds NUL, non-UTF-8 and CR bytes, inside and at the very end;
+// none contains LF (the separator). Records and expected roots are fixed
+// independently of roottrace by tests/reference/rfc6962_vectors.py.
+// ---------------------------------------------------------------------------
+
+const REC_L54: &[u8] = b"boundary-54:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x00\xff\xfe\r";
+const REC_L55: &[u8] = b"boundary-55:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\x00\xff\xfe\r";
+const REC_L56: &[u8] = b"boundary-56:cccccccccccccccccccccccccccccccccccccccc\xff\xfe\r\x00";
+const REC_L63: &[u8] = b"boundary-63:ddddddddddddddddddddddddddddddddddddddddddddddd\x00\xff\xfe\r";
+const REC_L64: &[u8] = b"boundary-64:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\x00\xff\xfe\r";
+const REC_L65: &[u8] = b"boundary-65:fffffffffffffffffffffffffffffffffffffffffffffffff\xff\xfe\r\x00";
+const REC_L146: &[u8] = b"long-record-146:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\x00\xff\xfe\rTAIL-MARKER-\x00\xff";
+
+// REC_L146 with ONE byte near the end changed (second-to-last). The root
+// must reflect the full record including its tail.
+const REC_V_TAIL: &[u8] = b"long-record-146:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\x00\xff\xfe\rTAIL-MARKER-\x01\xff";
+
+// Fixed batch mixing long and short records (8 records): long records in a
+// batch must be hashed by the same standard as when each is the only record.
+const MIXED: &[&[u8]] = &[
+    b"alpha",
+    REC_L54,
+    b"",
+    REC_L65,
+    b"delta\r",
+    REC_L146,
+    b"\xff\xfe\x00binary",
+    REC_L56,
+];
+
+// Independently fixed RFC 6962 roots (tests/reference/rfc6962_vectors.py).
+const ROOT_L54: &str = "44d6803161e92744f1d9a06d28a6571f43dc5cbcd4af9a20d045da94c8ef7187";
+const ROOT_L55: &str = "47559229e7d06fde6b97580ddbff3ec47ae12eeda56496302cfc7888256529b3";
+const ROOT_L56: &str = "f76075fc1a175a6ce37896ee738288c2cbaa7ad19b2336f4756106896e605fb8";
+const ROOT_L63: &str = "cb49a74a87ec01e003c18302a0905a84a65371dc72a7b5542a5414f060ef4d0b";
+const ROOT_L64: &str = "2f796ed6645515b2d7e4fe5d0971a907ac54f84d299001193db76b5159213e61";
+const ROOT_L65: &str = "8f7eaf79f09d79a4b29e96d949cd57bd604546ed5f82a11311b38862f79d167f";
+const ROOT_L146: &str = "2dd1eed6819e5ecee40397ce512908fddc19be932faa080ce7c9ac166291d584";
+const ROOT_V_TAIL: &str = "4f2cd36e8a157e169057fd342756966cf8742711aada133d2edae6ded37aec0f";
+const ROOT_MIXED: &str = "a62b61a3241e27a168df2125d40814733c5f5cc2e0e9da5d778c64b0104c5ee6";
+
+/// The long records with their independently fixed single-record roots.
+const LONG_SINGLES: &[(&str, &[u8], &str)] = &[
+    ("L54: 54-byte record, leaf input 55 bytes (padding boundary)", REC_L54, ROOT_L54),
+    ("L55: 55-byte record, leaf input 56 bytes (padding boundary)", REC_L55, ROOT_L55),
+    ("L56: 56-byte record, leaf input 57 bytes (padding boundary)", REC_L56, ROOT_L56),
+    ("L63: 63-byte record, leaf input 64 bytes (block boundary)", REC_L63, ROOT_L63),
+    ("L64: 64-byte record, leaf input 65 bytes (block boundary)", REC_L64, ROOT_L64),
+    ("L65: 65-byte record, leaf input 66 bytes (block boundary)", REC_L65, ROOT_L65),
+    ("L146: 146-byte record, leaf input spans three blocks", REC_L146, ROOT_L146),
+];
+
 #[test]
 fn roots_for_7_8_and_9_records_match_fixed_vectors() {
     assert_root(
@@ -351,6 +412,71 @@ fn empty_file_is_zero_records_single_lf_is_one_empty_record() {
         ROOT_ONE_EMPTY_RECORD,
     );
     assert_ne!(ROOT_EMPTY_FILE, ROOT_ONE_EMPTY_RECORD);
+}
+
+#[test]
+fn long_single_records_at_sha256_boundaries_match_fixed_roots() {
+    // The records really have the boundary lengths their names claim, and
+    // really carry NUL, non-UTF-8 and CR bytes as content (none holds LF).
+    let lengths: Vec<usize> = LONG_SINGLES.iter().map(|(_, rec, _)| rec.len()).collect();
+    assert_eq!(lengths, [54, 55, 56, 63, 64, 65, 146]);
+    for (_, rec, _) in LONG_SINGLES {
+        assert!(!rec.contains(&b'\n'), "record must not contain the LF separator");
+        assert!(rec.contains(&0x00) && rec.contains(&0xff) && rec.contains(&b'\r'));
+    }
+    assert!(REC_L54.ends_with(b"\r") && REC_L56.ends_with(b"\x00"));
+    // Each long record as a single-record batch has its own fixed root.
+    for (desc, rec, expected) in LONG_SINGLES {
+        assert_root(desc, &[rec], &join_lf(&[rec], true), expected);
+    }
+    // Distinct full contents give distinct fixed roots.
+    let roots: std::collections::BTreeSet<&&str> =
+        LONG_SINGLES.iter().map(|(_, _, root)| root).collect();
+    assert_eq!(roots.len(), LONG_SINGLES.len());
+}
+
+#[test]
+fn changing_one_byte_near_the_end_of_a_long_record_gives_its_own_fixed_root() {
+    // REC_V_TAIL differs from REC_L146 only in the second-to-last byte; the
+    // fixed root belongs to the modified FULL record, so an implementation
+    // that drops, truncates or decodes the tail cannot produce it.
+    assert_eq!(REC_V_TAIL.len(), REC_L146.len());
+    assert_eq!(REC_V_TAIL[..REC_V_TAIL.len() - 2], REC_L146[..REC_L146.len() - 2]);
+    assert_ne!(REC_V_TAIL[REC_V_TAIL.len() - 2], REC_L146[REC_L146.len() - 2]);
+    assert_eq!(REC_V_TAIL[REC_V_TAIL.len() - 1], REC_L146[REC_L146.len() - 1]);
+    assert_root(
+        "V_TAIL: L146 with one byte near the end changed, exact new root",
+        &[REC_V_TAIL],
+        &join_lf(&[REC_V_TAIL], true),
+        ROOT_V_TAIL,
+    );
+    assert_ne!(ROOT_V_TAIL, ROOT_L146, "a near-end byte must reach the root");
+}
+
+#[test]
+fn mixed_long_and_short_records_match_fixed_root() {
+    assert_eq!(MIXED.len(), 8);
+    assert_root(
+        "MIXED: long and short records in one batch, same standard as singles",
+        MIXED,
+        &join_lf(MIXED, true),
+        ROOT_MIXED,
+    );
+    for (_, _, single_root) in LONG_SINGLES {
+        assert_ne!(&ROOT_MIXED, single_root);
+    }
+}
+
+#[test]
+fn long_records_trailing_lf_only_terminates_the_last_record() {
+    // With and without a final LF, the same long record (or mixed batch) is
+    // the same record sequence and has the same fixed root.
+    for (desc, rec, expected) in LONG_SINGLES {
+        assert_root(desc, &[rec], &join_lf(&[rec], true), expected);
+        assert_root(desc, &[rec], &join_lf(&[rec], false), expected);
+    }
+    assert_root("MIXED trailing LF", MIXED, &join_lf(MIXED, true), ROOT_MIXED);
+    assert_root("MIXED no trailing LF", MIXED, &join_lf(MIXED, false), ROOT_MIXED);
 }
 
 #[test]
