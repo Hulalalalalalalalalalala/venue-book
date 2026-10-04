@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"os"
@@ -79,32 +81,173 @@ func newStore(dataDir string) (*store, error) {
 	return &store{path: path}, nil
 }
 
-// load 读取并解析全部记录。读不到、JSON 损坏、结构异常或任一场地的
-// 开放时段不合法都返回错误，调用方必须按 500 处理，绝不能把错误数据
-// 当作空列表覆盖，也不能跳过异常场地只返回剩余记录。
+// load 读取并解析全部记录。读不到、JSON 损坏、结构异常，或任一场地的名称、
+// 容量、时区、开放时段不满足新增功能已经公开的有效性规则，都返回错误，调用
+// 方必须按 500 处理。绝不能把错误数据当作空列表覆盖，也不能跳过异常场地只
+// 返回剩余记录；异常记录前后即使都有正常场地，整次读取也必须失败。
 func (s *store) load() ([]Venue, error) {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		return nil, err
 	}
-	var venues []Venue
-	if err := json.Unmarshal(raw, &venues); err != nil {
+	// 用 UseNumber 做通用解码，让 capacity 等数字保留原始十进制文本
+	// （json.Number），与新增入口一致：既不会把带小数的值静默舍入成整数，
+	// 也能逐位识别超过 JavaScript 安全整数范围、但仍在服务端支持范围内的
+	// 容量。直接解码到具体结构体会把缺失/null 的名称、容量、时区填成零值，
+	// 从而漏掉存量数据里的异常，因此这里先解码成 map 再逐字段严格校验。
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var records []map[string]any
+	if err := decoder.Decode(&records); err != nil {
 		return nil, fmt.Errorf("venues data is corrupted: %w", err)
 	}
-	if venues == nil {
-		venues = []Venue{}
+	// 拒绝数组之后的多余 JSON 内容（等价于此前 json.Unmarshal 的单值约束）。
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("venues data is corrupted: unexpected content after venue array")
 	}
-	for i := range venues {
-		// 兼容旧数据：字段缺省或为 null 仍按空数组（暂未开放）读取。
-		if venues[i].WeeklyHours == nil {
-			venues[i].WeeklyHours = []WeeklyHour{}
+
+	venues := make([]Venue, 0, len(records))
+	for i, rec := range records {
+		// 数组中的 null（解码为 nil map）或任何非对象条目都是数据异常，
+		// 不能变成名称为空、容量为零的场地。非对象条目在解码阶段已报错，
+		// 这里拦的是 null。
+		if rec == nil {
+			return nil, fmt.Errorf("venues data is corrupted at venue index %d: entry is null", i)
 		}
-		// 已保存数据同样必须满足新增时的全部时段规则；任一非法即视为损坏。
-		if err := validateHours(venues[i].WeeklyHours); err != nil {
-			return nil, fmt.Errorf("venues data is corrupted: venue %q has invalid weekly hours: %w", venues[i].ID, err)
+		venue, err := decodeStoredVenue(rec)
+		if err != nil {
+			return nil, fmt.Errorf("venues data is corrupted at venue index %d: %w", i, err)
 		}
+		venues = append(venues, venue)
 	}
 	return venues, nil
+}
+
+// decodeStoredVenue 对一条已保存记录逐字段做严格校验，规则与 buildVenue 在
+// 新增请求上公开的规则完全一致。任何不满足都返回错误（由 load 按数据损坏、
+// HTTP 500 处理），绝不把错误类型或缺失值转换成合法零值。
+func decodeStoredVenue(rec map[string]any) (Venue, error) {
+	// 标识不是本次校验重点，但类型错误仍属于结构异常：缺失/null 与历史行为
+	// 一样按空串读取，其它非字符串类型直接判损坏。
+	id, err := optionalStringField(rec, "id")
+	if err != nil {
+		return Venue{}, err
+	}
+
+	name, err := storedName(rec)
+	if err != nil {
+		return Venue{}, err
+	}
+
+	capacity, err := storedCapacity(rec)
+	if err != nil {
+		return Venue{}, err
+	}
+
+	timezone, err := storedTimezone(rec)
+	if err != nil {
+		return Venue{}, err
+	}
+
+	// 唯一保留的兼容规则：weeklyHours 缺省或为 null 仍按空数组（暂未开放）
+	// 读取。该兼容不扩展到名称、容量、时区；字段存在但类型不对同样判损坏。
+	rawHours, hasHours := rec["weeklyHours"]
+	var hours []WeeklyHour
+	if !hasHours || rawHours == nil {
+		hours = []WeeklyHour{}
+	} else {
+		hours, err = parseWeeklyHours(rawHours)
+		if err != nil {
+			// parseWeeklyHours 的错误来自新增校验路径，类型是 *apiError
+			//（400）。这里是存量数据读取，必须按数据损坏（500）处理，因此
+			// 只保留错误文案、剥掉 apiError 类型，避免上层 errors.As 误判为
+			// 这次请求填写有误。
+			return Venue{}, errors.New(err.Error())
+		}
+		// 已保存数据同样必须满足新增时的全部时段业务规则。
+		if err := validateHours(hours); err != nil {
+			return Venue{}, err
+		}
+	}
+
+	return Venue{
+		ID:          id,
+		Name:        name,
+		Capacity:    capacity,
+		Timezone:    timezone,
+		WeeklyHours: hours,
+	}, nil
+}
+
+// optionalStringField 读取一个可缺省的字符串字段：缺失或 null 返回空串，
+// 其它非字符串类型视为数据异常。
+func optionalStringField(rec map[string]any, field string) (string, error) {
+	value, ok := rec[field]
+	if !ok || value == nil {
+		return "", nil
+	}
+	str, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s 类型错误：应为字符串", field)
+	}
+	return str, nil
+}
+
+// storedName 校验已保存记录的名称：必须存在、非 null、是字符串，且去掉首尾
+// 空白后非空。合法性按去空白结果判断，但返回的是名称原文——读取绝不顺便
+// 改写或裁剪名称。
+func storedName(rec map[string]any) (string, error) {
+	value, ok := rec["name"]
+	if !ok || value == nil {
+		return "", errors.New("name 缺失或为 null")
+	}
+	name, ok := value.(string)
+	if !ok {
+		return "", errors.New("name 类型错误：应为字符串")
+	}
+	if strings.TrimSpace(name) == "" {
+		return "", errors.New("name 去除首尾空白后不能为空")
+	}
+	return name, nil
+}
+
+// storedCapacity 校验已保存记录的容量：必须存在、非 null，按 JSON 数字原文
+// 精确判断为 1 到 maxVenueCapacity 的正整数。缺失、null、零、负数、带小数、
+// 类型错误或超出服务端支持范围都属于数据异常，绝不截断或舍入成相邻整数。
+func storedCapacity(rec map[string]any) (int, error) {
+	value, ok := rec["capacity"]
+	if !ok || value == nil {
+		return 0, errors.New("capacity 缺失或为 null")
+	}
+	z, sign, isInt, inRange := parseJSONInteger(value)
+	if !isInt || sign <= 0 {
+		return 0, errors.New("capacity 必须是正整数")
+	}
+	if !inRange || z.Int64() > maxVenueCapacity {
+		return 0, errors.New("capacity 超出服务端支持的整数范围")
+	}
+	return int(z.Int64()), nil
+}
+
+// storedTimezone 校验已保存记录的时区：必须存在、非 null、是非空字符串、不
+// 能是 "Local"，且必须是有效的 IANA 时区名称。
+func storedTimezone(rec map[string]any) (string, error) {
+	value, ok := rec["timezone"]
+	if !ok || value == nil {
+		return "", errors.New("timezone 缺失或为 null")
+	}
+	timezone, ok := value.(string)
+	if !ok {
+		return "", errors.New("timezone 类型错误：应为字符串")
+	}
+	if timezone == "" || timezone == "Local" {
+		return "", errors.New("timezone 必须是有效的 IANA 时区名称")
+	}
+	if _, err := time.LoadLocation(timezone); err != nil {
+		return "", errors.New("timezone 必须是有效的 IANA 时区名称")
+	}
+	return timezone, nil
 }
 
 // save 通过同目录临时文件 + 重命名原子写入，避免半写状态损坏数据。
