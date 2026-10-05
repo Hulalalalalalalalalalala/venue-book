@@ -1,5 +1,7 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 
 const VERSION: &str = "0.1.0";
@@ -34,7 +36,11 @@ Exit status:
     2  usage error (unknown command, missing or extra arguments, bad index)";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    // File paths travel as OsString, never as String: on Unix a filename may
+    // contain arbitrary bytes (e.g. 0xff) that are not valid UTF-8, and such
+    // a path must still reach fs::read byte for byte. Only the command name
+    // and the record index are required to be UTF-8/ASCII text.
+    let args: Vec<std::ffi::OsString> = env::args_os().skip(1).collect();
     match args.as_slice() {
         [flag] if flag == "--version" => {
             println!("roottrace {VERSION}");
@@ -50,7 +56,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        [cmd, path, index] if cmd == "prove" => match parse_index(index) {
+        [cmd, path, index] if cmd == "prove" => match parse_index_os(index) {
             Some(index) => match proof_for_file(path, index) {
                 Ok(proof) => {
                     println!("{}", proof);
@@ -75,7 +81,10 @@ fn main() -> ExitCode {
                 }
             },
             None => {
-                eprintln!("roottrace: invalid record index '{index}': expected a decimal non-negative integer of ASCII digits");
+                eprintln!(
+                    "roottrace: invalid record index '{}': expected a decimal non-negative integer of ASCII digits",
+                    index.to_string_lossy()
+                );
                 eprintln!("{USAGE}");
                 ExitCode::from(2)
             }
@@ -92,13 +101,13 @@ enum ProveError {
     Missing(u64, u64),
 }
 
-fn merkle_root_of_file(path: &str) -> Result<[u8; 32], String> {
-    let data = fs::read(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+fn merkle_root_of_file(path: &OsStr) -> Result<[u8; 32], String> {
+    let data = fs::read(Path::new(path)).map_err(|e| read_error(path, e))?;
     Ok(mth(&split_records(&data)))
 }
 
-fn proof_for_file(path: &str, index: u64) -> Result<String, ProveError> {
-    let data = fs::read(path).map_err(|e| ProveError::Read(format!("cannot read '{path}': {e}")))?;
+fn proof_for_file(path: &OsStr, index: u64) -> Result<String, ProveError> {
+    let data = fs::read(Path::new(path)).map_err(|e| ProveError::Read(read_error(path, e)))?;
     let records = split_records(&data);
     let size = records.len() as u64;
     if index >= size {
@@ -109,15 +118,24 @@ fn proof_for_file(path: &str, index: u64) -> Result<String, ProveError> {
     Ok(proof_json(size, index, &root, &audit_path))
 }
 
-/// Parse a record index: one or more ASCII decimal digits, non-negative, no
-/// sign or whitespace, fitting in an unsigned 64-bit integer. Anything else
-/// (including "+1", " 1", "1.0", "", "-1") is rejected.
-fn parse_index(text: &str) -> Option<u64> {
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+/// Describe a failed file read. The path is rendered with the replacement
+/// character for bytes that are not valid UTF-8, so a failure stays a stable
+/// exit-1 error even when the path itself cannot be displayed.
+fn read_error(path: &OsStr, e: std::io::Error) -> String {
+    format!("cannot read '{}': {e}", path.to_string_lossy())
+}
+
+/// Parse a record index given as an OS argument: one or more ASCII decimal
+/// digits, non-negative, no sign or whitespace, fitting in an unsigned 64-bit
+/// integer. A non-UTF-8 argument fails the ASCII-digit check just like any
+/// other non-digit text, which is a usage error rather than a read error.
+fn parse_index_os(arg: &OsStr) -> Option<u64> {
+    let bytes = arg.as_encoded_bytes();
+    if bytes.is_empty() || !bytes.iter().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let mut value: u64 = 0;
-    for b in text.bytes() {
+    for &b in bytes {
         value = value.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
     }
     Some(value)
@@ -544,20 +562,30 @@ mod tests {
 
     #[test]
     fn index_parsing_accepts_only_ascii_unsigned_decimal() {
-        assert_eq!(parse_index("0"), Some(0));
-        assert_eq!(parse_index("00"), Some(0));
-        assert_eq!(parse_index("123"), Some(123));
-        assert_eq!(parse_index("18446744073709551615"), Some(u64::MAX));
-        assert_eq!(parse_index("18446744073709551616"), None);
-        assert_eq!(parse_index(""), None);
-        assert_eq!(parse_index("-1"), None);
-        assert_eq!(parse_index("+1"), None);
-        assert_eq!(parse_index("1.0"), None);
-        assert_eq!(parse_index(" 1"), None);
-        assert_eq!(parse_index("1 "), None);
-        assert_eq!(parse_index("0x1"), None);
-        assert_eq!(parse_index("①"), None);
+        let idx = |s: &str| parse_index_os(OsStr::new(s));
+        assert_eq!(idx("0"), Some(0));
+        assert_eq!(idx("00"), Some(0));
+        assert_eq!(idx("123"), Some(123));
+        assert_eq!(idx("18446744073709551615"), Some(u64::MAX));
+        assert_eq!(idx("18446744073709551616"), None);
+        assert_eq!(idx(""), None);
+        assert_eq!(idx("-1"), None);
+        assert_eq!(idx("+1"), None);
+        assert_eq!(idx("1.0"), None);
+        assert_eq!(idx(" 1"), None);
+        assert_eq!(idx("1 "), None);
+        assert_eq!(idx("0x1"), None);
+        assert_eq!(idx("①"), None);
         // Leading-zero overflow is still overflow.
-        assert_eq!(parse_index("0018446744073709551616"), None);
+        assert_eq!(idx("0018446744073709551616"), None);
+
+        // Non-UTF-8 bytes can never name a decimal index: rejected as a usage
+        // error rather than read as a path or crashing argument parsing.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(parse_index_os(OsStr::from_bytes(b"1\xff")), None);
+            assert_eq!(parse_index_os(OsStr::from_bytes(b"\xff")), None);
+        }
     }
 }
