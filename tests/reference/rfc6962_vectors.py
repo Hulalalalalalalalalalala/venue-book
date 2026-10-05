@@ -23,7 +23,19 @@ structurally different ways:
 
 A recursive RFC verifier (verify_inclusion) re-hashes every printed proof and
 must arrive back at the batch root; proofs for duplicate content at another
-position are additionally checked NOT to verify.
+position are additionally checked NOT to verify. A second, structurally
+different verifier (verify_inclusion_bitwise, the bit-driven fold used by CT
+implementations) must agree with the recursive one at every position of every
+checked sequence, and the two are what anchors the big-tree vectors below.
+
+The big-tree section emits inclusion-proof vectors for tree sizes 2**63,
+2**63 + 1 and 2**64 - 1. Batches that large cannot be materialised, and they
+do not need to be: `verify` exists so a receiver holding one record, its
+proof, and an independently confirmed tree size and root can check membership
+without the batch. The audit paths are built from fixed, openly derived
+sibling hashes (SHA-256 of "big-tree-sibling-<i>") standing in for the subtree
+hashes, and each printed root is whatever those siblings fold into with the
+target record at the claimed position, computed by BOTH verifiers.
 
 Records are split exactly as roottrace documents: raw bytes on LF, the
 separator excluded, a trailing LF only terminates the last record, and an
@@ -151,6 +163,49 @@ def verify_inclusion(leaf, m, n, path):
     root, pos = sub(m, n, 0)
     assert pos == len(path), "proof length mismatch"
     return root
+
+
+def verify_inclusion_bitwise(leaf, m, n, path):
+    """Structurally different verifier: the bit-driven fold used by CT
+    implementations. The side each sibling hash combines on is decided from
+    the low bits of the running leaf/last-leaf indices, never from the
+    recursive subtree split, so agreement with verify_inclusion is a real
+    cross-check. Works for any n that fits a Python int, including sizes far
+    beyond what could be materialised. Returns the root."""
+    if not 0 <= m < n:
+        raise IndexError(f"index {m} out of range for tree size {n}")
+    fn, sn = m, n - 1
+    r = sha256(b"\x00" + leaf)
+    for p in path:
+        assert sn != 0, "path longer than the tree requires"
+        if (fn & 1) == 1 or fn == sn:
+            r = sha256(b"\x01" + p + r)
+            while fn != 0 and (fn & 1) == 0:
+                fn >>= 1
+                sn >>= 1
+        else:
+            r = sha256(b"\x01" + r + p)
+        fn >>= 1
+        sn >>= 1
+    assert sn == 0, "path shorter than the tree requires"
+    return r
+
+
+def audit_path_length(m, n):
+    """Number of sibling hashes the RFC 6962 geometry requires for leaf m of
+    an n-leaf tree, counted by descending the subtree sizes without hashing.
+    Uneven trees keep the RFC shape: no padding, no duplicated last leaf."""
+    assert 0 <= m < n
+    depth = 0
+    while n > 1:
+        k = 1 << ((n - 1).bit_length() - 1)
+        if m < k:
+            n = k
+        else:
+            m -= k
+            n -= k
+        depth += 1
+    return depth
 
 
 def root_of_file_bytes(data: bytes):
@@ -439,6 +494,93 @@ def main():
     assert p_dup_0 != p_dup_4
     assert verify_inclusion(BASE9[4], 0, 9, p_dup_4) != mth_recursive(BASE9)
     assert verify_inclusion(BASE9[0], 4, 9, p_dup_0) != mth_recursive(BASE9)
+
+    # The bit-driven verifier and the path-length counter are what anchors
+    # the big-tree vectors below; validate them against the recursive
+    # definitions on real trees at EVERY position of many sizes, including
+    # both sides of power-of-two boundaries.
+    for n in list(range(1, 130)) + [255, 256, 257, 300]:
+        recs = [b"synthetic-%d" % i for i in range(n)]
+        root = mth_recursive(recs)
+        assert root == mth_fold(recs)
+        for m in range(n):
+            p = audit_path_recursive(recs, m)
+            assert len(p) == audit_path_length(m, n)
+            assert verify_inclusion(recs[m], m, n, p) == root
+            assert verify_inclusion_bitwise(recs[m], m, n, p) == root
+
+    # ------------------------------------------------------------------
+    # Big-tree inclusion proofs: tree sizes 2**63 (a power of two),
+    # 2**63 + 1 and 2**64 - 1 (uneven). Such batches cannot be
+    # materialised, and they do not need to be: the audit path for one
+    # leaf is only ~64 sibling hashes. The siblings here are fixed, openly
+    # derived stand-ins for the subtree hashes; each root is whatever they
+    # fold into with BIG_RECORD at the claimed position. Positions cover
+    # the first and last records and both sides of the top-level
+    # left/right subtree split, with leaf indices far beyond 32 bits.
+    # Each case consumes the shared sibling pool in rotation from its own
+    # offset, so cases whose RFC geometry coincides (e.g. index 0 folds
+    # all-siblings-on-the-right in ANY tree) still anchor to distinct
+    # roots and a size-blind fold cannot pass. Both verifiers must agree
+    # on every root.
+    # ------------------------------------------------------------------
+    BIG_RECORD = b"big-tree-record:\x00\xff\xfetail\r"
+    assert b"\n" not in BIG_RECORD
+    BIG_SIBLINGS = [sha256(b"big-tree-sibling-%d" % i) for i in range(64)]
+
+    P63 = 1 << 63
+    BIG_CASES = [
+        ("P63_FIRST", P63, 0, "first record of the balanced 2**63 tree"),
+        ("P63_LEFT_OF_SPLIT", P63, (1 << 62) - 1,
+         "last record left of the top-level split of 2**63"),
+        ("P63_RIGHT_OF_SPLIT", P63, 1 << 62,
+         "first record right of the top-level split of 2**63"),
+        ("P63_LAST", P63, P63 - 1, "last record of the balanced 2**63 tree"),
+        ("P63P1_FIRST", P63 + 1, 0, "first record of the uneven 2**63+1 tree"),
+        ("P63P1_LEFT_OF_SPLIT", P63 + 1, P63 - 1,
+         "last record of the size-2**63 left subtree of 2**63+1"),
+        ("P63P1_LAST", P63 + 1, P63,
+         "lone right-subtree record of 2**63+1: path is a single hash "
+         "(no padding, no duplicated tail)"),
+        ("MAX_FIRST", (1 << 64) - 1, 0, "first record of the 2**64-1 tree"),
+        ("MAX_LEFT_OF_SPLIT", (1 << 64) - 1, P63 - 1,
+         "last record of the size-2**63 left subtree of 2**64-1"),
+        ("MAX_RIGHT_OF_SPLIT", (1 << 64) - 1, P63,
+         "first record of the size-(2**63-1) right subtree of 2**64-1"),
+        ("MAX_LAST", (1 << 64) - 1, (1 << 64) - 2,
+         "last record of the 2**64-1 tree (uneven right spine)"),
+    ]
+    print("# Big-tree inclusion-proof vectors (tree sizes 2**63, 2**63+1 and")
+    print("# 2**64-1; sibling hashes are openly derived stand-ins, each case")
+    print("# consumes the pool in rotation from its own offset, and every root")
+    print("# is folded from the record and siblings by TWO structurally")
+    print("# different verifiers that must agree):")
+    print()
+    print(f"const REC_BIG_TREE: &[u8] = {rust_byte_string(BIG_RECORD)};")
+    elems = ", ".join(f'"{h.hex()}"' for h in BIG_SIBLINGS)
+    print(f"const BIG_TREE_SIBLINGS: &[&str] = &[{elems}];")
+    print("// (tree_size, leaf_index, sibling offset, audit_path length, root);")
+    print("// the audit path is BIG_TREE_SIBLINGS cycled from the offset.")
+    print("const BIG_TREE_CASES: &[(u64, u64, usize, usize, &str)] = &[")
+    big_roots = set()
+    for j, (tag, n, m, desc) in enumerate(BIG_CASES):
+        offset = (j * 6) % len(BIG_SIBLINGS)
+        depth = audit_path_length(m, n)
+        path = [BIG_SIBLINGS[(offset + i) % len(BIG_SIBLINGS)]
+                for i in range(depth)]
+        r1 = verify_inclusion(BIG_RECORD, m, n, path)
+        r2 = verify_inclusion_bitwise(BIG_RECORD, m, n, path)
+        assert r1 == r2, f"big-tree verifiers disagree for {tag}"
+        big_roots.add(r1)
+        print(f"    // {tag}: {desc}")
+        print(f"    ({n}, {m}, {offset}, {depth}, \"{r1.hex()}\"),")
+    print("];")
+    print()
+    assert len(big_roots) == len(BIG_CASES), "big-tree roots must be distinct"
+    # Geometry spot-checks: the uneven trees keep the RFC shape.
+    assert audit_path_length(P63, P63 + 1) == 1
+    assert audit_path_length(0, P63 + 1) == 64
+    assert audit_path_length((1 << 64) - 2, (1 << 64) - 1) == 63
 
     # Fixed proof vectors emitted for the Rust prove regression tests:
     # B9 (uneven, n=9) at its first, duplicate-content and last positions;
