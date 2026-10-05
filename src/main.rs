@@ -723,21 +723,24 @@ fn split_records(data: &[u8]) -> Vec<&[u8]> {
     records
 }
 
-/// RFC 6962 section 2.1 leaf hash: SHA-256(0x00 || data).
+/// RFC 6962 section 2.1 leaf hash: SHA-256(0x00 || data). The record bytes
+/// are fed to the hasher in place: no copy of `data` is made, so the temporary
+/// memory a leaf hash needs is bounded by the hasher's fixed-size state
+/// however long the record is.
 fn leaf_hash(data: &[u8]) -> [u8; 32] {
-    let mut input = Vec::with_capacity(1 + data.len());
-    input.push(0x00);
-    input.extend_from_slice(data);
-    sha256(&input)
+    let mut hasher = Sha256::new();
+    hasher.update(&[0x00]);
+    hasher.update(data);
+    hasher.finalize()
 }
 
 /// RFC 6962 section 2.1 interior node hash: SHA-256(0x01 || left || right).
 fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut input = Vec::with_capacity(65);
-    input.push(0x01);
-    input.extend_from_slice(left);
-    input.extend_from_slice(right);
-    sha256(&input)
+    let mut hasher = Sha256::new();
+    hasher.update(&[0x01]);
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize()
 }
 
 /// Construct the RFC 6962 Merkle tree over a batch. This is the SINGLE place
@@ -860,23 +863,88 @@ const K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+/// One-shot SHA-256 over a byte slice. The input is processed in place,
+/// block by block; nothing is copied, so the extra memory is the fixed-size
+/// hasher state regardless of the input length.
 fn sha256(data: &[u8]) -> [u8; 32] {
-    #[cfg(test)]
-    SHA256_CALLS.with(|c| c.set(c.get() + 1));
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize()
+}
 
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+/// Incremental SHA-256 (FIPS 180-4). Input is consumed in 64-byte blocks as
+/// it arrives; only one partial block is ever buffered, so the working set is
+/// a fixed few hundred bytes no matter how much data is hashed. The domain
+/// separation prefixes of RFC 6962 (0x00 for leaves, 0x01 for interior
+/// nodes) are simply the first `update` bytes, never a copied concatenation.
+struct Sha256 {
+    h: [u32; 8],
+    /// Bytes of the current incomplete block; `buf_len < 64` between blocks.
+    buf: [u8; 64],
+    buf_len: usize,
+    /// Total bytes fed so far (before padding), for the length trailer.
+    total_len: u64,
+}
+
+impl Sha256 {
+    fn new() -> Self {
+        Sha256 {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_len: 0,
+        }
     }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for block in msg.chunks_exact(64) {
+    fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        // Top up a partially filled block first.
+        if self.buf_len > 0 {
+            let take = (64 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len == 64 {
+                let block = self.buf;
+                self.compress(&block);
+                self.buf_len = 0;
+            }
+        }
+        // Whole blocks are compressed straight out of the caller's slice.
+        while data.len() >= 64 {
+            let (block, rest) = data.split_at(64);
+            self.compress(block.try_into().unwrap());
+            data = rest;
+        }
+        // Keep the tail for the next update or the padding in finalize.
+        if !data.is_empty() {
+            self.buf[..data.len()].copy_from_slice(data);
+            self.buf_len = data.len();
+        }
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        #[cfg(test)]
+        SHA256_CALLS.with(|c| c.set(c.get() + 1));
+        let bit_len = self.total_len.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.buf_len != 56 {
+            self.update(&[0]);
+        }
+        self.update(&bit_len.to_be_bytes());
+        debug_assert_eq!(self.buf_len, 0);
+
+        let mut out = [0u8; 32];
+        for (i, word) in self.h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    fn compress(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
         for (i, word) in block.chunks_exact(4).enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
@@ -890,7 +958,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
                 .wrapping_add(s1);
         }
 
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = self.h;
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
@@ -912,21 +980,15 @@ fn sha256(data: &[u8]) -> [u8; 32] {
             a = t1.wrapping_add(t2);
         }
 
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
+        self.h[0] = self.h[0].wrapping_add(a);
+        self.h[1] = self.h[1].wrapping_add(b);
+        self.h[2] = self.h[2].wrapping_add(c);
+        self.h[3] = self.h[3].wrapping_add(d);
+        self.h[4] = self.h[4].wrapping_add(e);
+        self.h[5] = self.h[5].wrapping_add(f);
+        self.h[6] = self.h[6].wrapping_add(g);
+        self.h[7] = self.h[7].wrapping_add(hh);
     }
-
-    let mut out = [0u8; 32];
-    for (i, word) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    out
 }
 
 #[cfg(test)]
@@ -987,6 +1049,36 @@ mod tests {
             )),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
+        // A million 'a' bytes: the padding boundary and length trailer must
+        // be right far beyond a single block.
+        assert_eq!(
+            hex_of(&sha256(&vec![b'a'; 1_000_000])),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn sha256_streaming_matches_one_shot_at_every_split() {
+        // Feeding the same bytes in any chunking must give the one-shot
+        // digest; lengths around the 56-byte padding boundary and the
+        // 64-byte block boundary are the interesting cases.
+        let data: Vec<u8> = (0..200u32).map(|i| (i * 37 + 11) as u8).collect();
+        let want = sha256(&data);
+        for chunk in 1..=data.len() {
+            let mut hasher = Sha256::new();
+            for piece in data.chunks(chunk) {
+                hasher.update(piece);
+            }
+            assert_eq!(hex_of(&hasher.finalize()), hex_of(&want), "chunk size {chunk}");
+        }
+        // Byte-at-a-time over a long input crossing many blocks.
+        let long: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let want = sha256(&long);
+        let mut hasher = Sha256::new();
+        for b in &long {
+            hasher.update(&[*b]);
+        }
+        assert_eq!(hex_of(&hasher.finalize()), hex_of(&want));
     }
 
     #[test]
