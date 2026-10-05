@@ -25,6 +25,12 @@ A recursive RFC verifier (verify_inclusion) re-hashes every printed proof and
 must arrive back at the batch root; proofs for duplicate content at another
 position are additionally checked NOT to verify.
 
+A final section covers trees too large to materialise (sizes 2**63, 2**63+1
+and 2**64-1): the audit path is built from deterministic synthetic sibling
+hashes and the root an honest verifier must recompute is derived two
+structurally different ways (recursive descent, and an iterative top-down
+turn walk folded leaf-to-root), which must agree.
+
 Records are split exactly as roottrace documents: raw bytes on LF, the
 separator excluded, a trailing LF only terminates the last record, and an
 empty file holds zero records.
@@ -158,6 +164,114 @@ def root_of_file_bytes(data: bytes):
     a, b = mth_recursive(recs), mth_fold(recs)
     assert a == b, "reference algorithms disagree"
     return a.hex(), recs
+
+
+# ---------------------------------------------------------------------------
+# Big-tree inclusion proofs: tree sizes 2**63, 2**63+1 and 2**64-1 sit at or
+# above the signed/unsigned 64-bit boundary, so no batch file can ever be
+# materialised for them. The proof is therefore synthetic: one fixed target
+# record, and an audit path whose element i is the deterministic 32-byte
+# value written as the 64-character lowercase hex of i (reproduced in Rust
+# as format!("{i:064x}")). The trusted root is whatever an honest RFC 6962
+# verifier recombines from (record, leaf_index, tree_size, audit_path); it is
+# derived here by two structurally different computations that must agree.
+# ---------------------------------------------------------------------------
+
+BIG_TREE_RECORD = b"big-tree-record\x00\xff\xfe"
+
+
+def big_tree_path(depth):
+    return [bytes.fromhex("%064x" % i) for i in range(depth)]
+
+
+def big_tree_path_for(m, n):
+    """The synthetic audit path for leaf m in a tree of n records: one
+    element per level on the root-to-leaf descent."""
+    depth = 0
+    lo, hi = 0, n
+    while hi - lo > 1:
+        size = hi - lo
+        k = 1 << ((size - 1).bit_length() - 1)
+        if m < lo + k:
+            hi = lo + k
+        else:
+            lo = lo + k
+        depth += 1
+    return big_tree_path(depth)
+
+
+def big_root_recursive(record, m, n, path):
+    """Direct transcription of the RFC 6962-bis recursive verifier: re-derive
+    the combination order from the (uneven) subtree geometry while consuming
+    the path in its given leaf-to-root order."""
+    leaf = sha256(b"\x00" + record)
+
+    def sub(mm, nn, pos):
+        if nn == 1:
+            return leaf, pos
+        k = 1 << ((nn - 1).bit_length() - 1)
+        if mm < k:
+            lh, pos = sub(mm, k, pos)
+            rh = path[pos]
+            pos += 1
+        else:
+            rh, pos = sub(mm - k, nn - k, pos)
+            lh = path[pos]
+            pos += 1
+        return sha256(b"\x01" + lh + rh), pos
+
+    root, pos = sub(m, n, 0)
+    assert pos == len(path), "proof length mismatch"
+    return root
+
+
+def big_root_turn_fold(record, m, n, path):
+    """Structurally different: walk the containing interval from the root
+    downward recording only left/right turns, then fold the path hashes
+    leaf-to-root (deepest turn first) in a single pass."""
+    turns = []
+    lo, hi = 0, n
+    while hi - lo > 1:
+        size = hi - lo
+        k = 1 << ((size - 1).bit_length() - 1)
+        if m < lo + k:
+            turns.append(True)   # accumulated hash will be the LEFT child
+            hi = lo + k
+        else:
+            turns.append(False)  # accumulated hash will be the RIGHT child
+            lo = lo + k
+    assert len(turns) == len(path), "proof length mismatch"
+    acc = sha256(b"\x00" + record)
+    for i, is_left in enumerate(reversed(turns)):
+        if is_left:
+            acc = sha256(b"\x01" + acc + path[i])
+        else:
+            acc = sha256(b"\x01" + path[i] + acc)
+    return acc
+
+
+POW63 = 1 << 63
+U64_MAX = (1 << 64) - 1
+
+# (tag, tree_size, leaf_index): first and last records, both sides of the
+# left/right subtree boundary k (largest power of two strictly below the
+# size), and indices straddling the 32-bit boundary. Every index beyond
+# 2**32-1 exercises exact 64-bit index handling.
+BIG_TREE_CASES = [
+    ("2**63 (power-of-two tree), first record", POW63, 0),
+    ("2**63, record 2**32-1 (top of 32-bit range)", POW63, (1 << 32) - 1),
+    ("2**63, record 2**32 (first index past 32 bits)", POW63, 1 << 32),
+    ("2**63, record k-1 (last of left subtree)", POW63, (1 << 62) - 1),
+    ("2**63, record k (first of right subtree)", POW63, 1 << 62),
+    ("2**63, last record", POW63, POW63 - 1),
+    ("2**63+1 (uneven), first record", POW63 + 1, 0),
+    ("2**63+1 (uneven), record k-1 (last of left subtree)", POW63 + 1, POW63 - 1),
+    ("2**63+1 (uneven), last record = k (lone right subtree)", POW63 + 1, POW63),
+    ("2**64-1 (uneven), first record", U64_MAX, 0),
+    ("2**64-1 (uneven), record k-1 (last of left subtree)", U64_MAX, POW63 - 1),
+    ("2**64-1 (uneven), record k (first of right subtree)", U64_MAX, POW63),
+    ("2**64-1 (uneven), last record", U64_MAX, U64_MAX - 1),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +614,47 @@ def main():
     print(f"#   root ROOT_MIXED = {roots['MIXED']}")
     rust_record_list(MIXED_M, "MIXED_M_RECORDS")
     print(f"#   root ROOT_MIXED_M = {roots['MIXED_M']}")
+
+    # ------------------------------------------------------------------
+    # Big-tree synthetic proofs. First anchor the two big-tree root
+    # computations to the already cross-validated small-tree machinery:
+    # on every real batch they must recompute the batch root from the real
+    # audit path, exactly like verify_inclusion.
+    # ------------------------------------------------------------------
+    for tag, recs in proof_sequences:
+        n = len(recs)
+        expected = bytes.fromhex(roots[tag])
+        for m in range(n):
+            path = audit_path_recursive(recs, m)
+            assert big_root_recursive(recs[m], m, n, path) == expected
+            assert big_root_turn_fold(recs[m], m, n, path) == expected
+
+    # Depth sanity: a balanced 2**63 tree has depth 63 everywhere; 2**63+1
+    # puts the first record at depth 64 and its lone last record at depth 1
+    # (the uneven split, never padding); 2**64-1 keeps its last record at
+    # depth 63.
+    depth_of = lambda m, n: len(big_tree_path_for(m, n))
+    assert depth_of(0, POW63) == 63 and depth_of(POW63 - 1, POW63) == 63
+    assert depth_of(0, POW63 + 1) == 64 and depth_of(POW63, POW63 + 1) == 1
+    assert depth_of(U64_MAX - 1, U64_MAX) == 63
+
+    print()
+    print("# Big-tree inclusion proofs (synthetic paths; sizes at the 64-bit")
+    print("# boundary cannot be materialised as batches). Both independent root")
+    print("# computations agree on every case. audit_path element i is the")
+    print("# 64-char lowercase hex of i (Rust: format!(\"{i:064x}\")).")
+    print("# Record bytes: %r" % BIG_TREE_RECORD)
+    print()
+    print("const BIG_TREE_CASES: &[BigCase] = &[")
+    for tag, n, m in BIG_TREE_CASES:
+        path = big_tree_path_for(m, n)
+        r1 = big_root_recursive(BIG_TREE_RECORD, m, n, path)
+        r2 = big_root_turn_fold(BIG_TREE_RECORD, m, n, path)
+        assert r1 == r2, f"big-tree root computations disagree for {tag}"
+        print(f"    // {tag}; audit_path depth {len(path)}")
+        print(f"    BigCase {{ size: {n}, index: {m}, depth: {len(path)}, "
+              f"root: \"{r1.hex()}\" }},")
+    print("];")
 
 
 if __name__ == "__main__":
