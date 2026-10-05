@@ -1371,6 +1371,158 @@ mod tests {
         assert!(parse_proof(ok.as_bytes()).is_ok());
     }
 
+    // --- JSON string escapes in proofs ---------------------------------------
+    //
+    // A proof re-saved by another JSON tool may spell any string character as
+    // a \uXXXX escape. That is a change of representation, not of content:
+    // after decoding, field names and hashes must behave exactly as if they
+    // had been written directly.
+
+    /// Replace every character for which `escape` holds with its `\uXXXX`
+    /// form (uppercase hex letters, matching what many JSON writers emit).
+    fn escape_selected(s: &str, escape: impl Fn(char) -> bool) -> String {
+        let mut out = String::new();
+        for c in s.chars() {
+            if escape(c) {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn parse_proof_decodes_unicode_escapes_in_names_and_hashes() {
+        let refs: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let (root, path) = root_and_path(&refs, 1);
+        let direct = valid_proof_bytes(3, 1, &root, &path);
+        let want = parse_proof(&direct).expect("canonical proof parses");
+
+        // Every field name and every hash character escaped, with uppercase
+        // hex letters inside the \uXXXX sequences.
+        let escaped = format!(
+            "{{\"{}\":3,\"{}\":1,\"{}\":\"{}\",\"{}\":[\"{}\",\"{}\"]}}",
+            escape_selected("tree_size", |_| true),
+            escape_selected("leaf_index", |_| true),
+            escape_selected("root", |_| true),
+            escape_selected(&hex(&root), |_| true),
+            escape_selected("audit_path", |_| true),
+            escape_selected(&hex(&path[0]), |_| true),
+            escape_selected(&hex(&path[1]), |_| true),
+        );
+        let got = parse_proof(escaped.as_bytes()).expect("fully escaped proof must parse");
+        assert_eq!(got.tree_size, want.tree_size);
+        assert_eq!(got.leaf_index, want.leaf_index);
+        assert_eq!(got.root, want.root);
+        assert_eq!(got.audit_path, want.audit_path);
+
+        // Direct and escaped characters mixed within one string.
+        let mixed = format!(
+            "{{\"tr\\u0065e_siz\\u0065\":3,\"\\u006Ceaf_index\":1,\"r\\u006Fot\":\"{}\",\"audit_p\\u0061th\":[\"{}\",\"{}\"]}}",
+            escape_selected(&hex(&root), |c| c == 'a' || c == 'e'),
+            escape_selected(&hex(&path[0]), |c| c.is_ascii_digit()),
+            escape_selected(&hex(&path[1]), |c| matches!(c, 'b' | 'c' | 'd' | 'f')),
+        );
+        let got = parse_proof(mixed.as_bytes()).expect("mixed direct/escaped proof must parse");
+        assert_eq!(got.root, root);
+        assert_eq!(got.audit_path, path);
+    }
+
+    #[test]
+    fn parse_proof_detects_duplicate_keys_after_escape_decoding() {
+        let refs: Vec<&[u8]> = vec![b"a", b"b"];
+        let (root, path) = root_and_path(&refs, 0);
+        let h = hex(&root);
+        let p0 = hex(&path[0]);
+        // Each pair spells the same decoded name twice, once with an escape;
+        // even identical values are duplicates, never "pick either one".
+        let cases = [
+            format!("{{\"tree_size\":2,\"tr\\u0065e_size\":2,\"leaf_index\":0,\"root\":\"{h}\",\"audit_path\":[\"{p0}\"]}}"),
+            format!("{{\"tree_size\":2,\"leaf_index\":0,\"l\\u0065af_index\":0,\"root\":\"{h}\",\"audit_path\":[\"{p0}\"]}}"),
+            format!("{{\"tree_size\":2,\"leaf_index\":0,\"root\":\"{h}\",\"r\\u006Fot\":\"{h}\",\"audit_path\":[\"{p0}\"]}}"),
+            format!("{{\"tree_size\":2,\"leaf_index\":0,\"root\":\"{h}\",\"audit_path\":[\"{p0}\"],\"\\u0061udit_path\":[\"{p0}\"]}}"),
+            // Same decoded name, different value: still a format error.
+            format!("{{\"tree_size\":2,\"leaf_index\":0,\"root\":\"{h}\",\"\\u0072oot\":\"{p0}\",\"audit_path\":[\"{p0}\"]}}"),
+        ];
+        for case in cases {
+            assert!(parse_proof(case.as_bytes()).is_err(), "duplicate via escape: {case}");
+        }
+    }
+
+    #[test]
+    fn parse_proof_rejects_bad_escapes_and_bad_string_bytes() {
+        let refs: Vec<&[u8]> = vec![b"a", b"b"];
+        let (root, _) = root_and_path(&refs, 0);
+        let h = hex(&root);
+        let good = |root_json: &str| {
+            format!("{{\"tree_size\":2,\"leaf_index\":0,\"root\":{root_json},\"audit_path\":[]}}")
+        };
+        assert!(parse_proof(good(&format!("\"{h}\"")).as_bytes()).is_ok());
+
+        let bad_strings = [
+            "\\x",           // unknown escape
+            "\\u12",         // truncated unicode escape
+            "\\u12g4",       // non-hex digit in unicode escape
+            "\\uD800",       // lone high surrogate
+            "\\uD800\\n",    // high surrogate not followed by \\u
+            "\\uD800\\u0041", // high surrogate followed by a non-low escape
+            "\\uD800\\uD800", // high surrogate followed by another high one
+            "\\uDC00",       // lone low surrogate
+        ];
+        for bad in bad_strings {
+            let case = good(&format!("\"{bad}\""));
+            assert!(parse_proof(case.as_bytes()).is_err(), "escape {bad:?}");
+        }
+        // A \u escape cut off by the end of the file.
+        let cut = format!("{{\"tree_size\":2,\"leaf_index\":0,\"root\":\"{h}\",\"audit_path\":[\"\\u12");
+        assert!(parse_proof(cut.as_bytes()).is_err());
+
+        // Unescaped control bytes and invalid UTF-8 inside a string.
+        for raw in [b"\x01".as_slice(), b"\x1f", b"\n", b"\t", b"\xff", b"\xc3"] {
+            let mut case = good("\"").into_bytes();
+            case.extend_from_slice(raw);
+            case.extend_from_slice(b"\",\"audit_path\":[]}");
+            assert!(parse_proof(&case).is_err(), "raw byte {raw:?} in string");
+        }
+    }
+
+    #[test]
+    fn parse_proof_applies_hash_rules_after_escape_decoding() {
+        let refs: Vec<&[u8]> = vec![b"a", b"b"];
+        let (root, path) = root_and_path(&refs, 0);
+        let h = hex(&root);
+        let p0 = hex(&path[0]);
+        let wrap = |root_json: &str, path_json: &str| {
+            format!("{{\"tree_size\":2,\"leaf_index\":0,\"root\":{root_json},\"audit_path\":[{path_json}]}}")
+        };
+
+        // An escape that decodes to an uppercase hex letter is still an
+        // uppercase hash character: rejected.
+        let upper_a = wrap(&format!("\"\\u0041{}\"", &h[1..]), &format!("\"{p0}\""));
+        assert!(parse_proof(upper_a.as_bytes()).is_err());
+        // An escape that decodes to a non-hex character.
+        let gee = wrap(&format!("\"\\u0067{}\"", &h[1..]), &format!("\"{p0}\""));
+        assert!(parse_proof(gee.as_bytes()).is_err());
+        // Length is judged after decoding: 63 and 65 decoded characters.
+        let short = wrap(&format!("\"\\u0061{}\"", &h[1..63]), &format!("\"{p0}\""));
+        assert!(parse_proof(short.as_bytes()).is_err());
+        let long = wrap(&format!("\"{h}\\u0030\""), &format!("\"{p0}\""));
+        assert!(parse_proof(long.as_bytes()).is_err());
+        // The same rules bind audit_path elements.
+        let path_upper = wrap(&format!("\"{h}\""), &format!("\"\\u0041{}\"", &p0[1..]));
+        assert!(parse_proof(path_upper.as_bytes()).is_err());
+
+        // A fully escaped but valid hash still decodes to the same 32 bytes.
+        let ok = wrap(
+            &format!("\"{}\"", escape_selected(&h, |_| true)),
+            &format!("\"{}\"", escape_selected(&p0, |_| true)),
+        );
+        let got = parse_proof(ok.as_bytes()).expect("escaped valid hashes must parse");
+        assert_eq!(got.root, root);
+        assert_eq!(got.audit_path, path);
+    }
+
     // --- end-to-end verification logic --------------------------------------
 
     /// Build a real proof object (as produced by `prove`) for one record of a
