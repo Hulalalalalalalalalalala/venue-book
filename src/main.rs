@@ -1,5 +1,7 @@
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 
 const VERSION: &str = "0.1.0";
@@ -34,13 +36,18 @@ Exit status:
     2  usage error (unknown command, missing or extra arguments, bad index)";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    // Raw OS arguments: file paths are handed to the filesystem exactly as
+    // received, byte for byte. On Unix a path may contain bytes that are not
+    // valid UTF-8 (e.g. 0xff); such a path is not invalid and must reach the
+    // file rather than aborting argument collection. Only the command name
+    // and the record index are required to be UTF-8 text.
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
     match args.as_slice() {
-        [flag] if flag == "--version" => {
+        [flag] if flag == OsStr::new("--version") => {
             println!("roottrace {VERSION}");
             ExitCode::SUCCESS
         }
-        [cmd, path] if cmd == "root" => match merkle_root_of_file(path) {
+        [cmd, path] if cmd == OsStr::new("root") => match merkle_root_of_file(Path::new(path)) {
             Ok(root) => {
                 println!("{}", hex(&root));
                 ExitCode::SUCCESS
@@ -50,8 +57,8 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        [cmd, path, index] if cmd == "prove" => match parse_index(index) {
-            Some(index) => match proof_for_file(path, index) {
+        [cmd, path, index] if cmd == OsStr::new("prove") => match parse_index(index) {
+            Some(index) => match proof_for_file(Path::new(path), index) {
                 Ok(proof) => {
                     println!("{}", proof);
                     ExitCode::SUCCESS
@@ -75,7 +82,8 @@ fn main() -> ExitCode {
                 }
             },
             None => {
-                eprintln!("roottrace: invalid record index '{index}': expected a decimal non-negative integer of ASCII digits");
+                let shown = index.to_string_lossy();
+                eprintln!("roottrace: invalid record index '{shown}': expected a decimal non-negative integer of ASCII digits");
                 eprintln!("{USAGE}");
                 ExitCode::from(2)
             }
@@ -92,13 +100,22 @@ enum ProveError {
     Missing(u64, u64),
 }
 
-fn merkle_root_of_file(path: &str) -> Result<[u8; 32], String> {
-    let data = fs::read(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+/// Render a path for a human-readable error message. This is used ONLY in
+/// diagnostics: the filesystem is always given the raw `Path`, never this
+/// lossy rendering, so a file whose name contains 0xff is not confused with a
+/// differently named file that merely displays the same way.
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn merkle_root_of_file(path: &Path) -> Result<[u8; 32], String> {
+    let data = fs::read(path).map_err(|e| format!("cannot read '{}': {e}", display_path(path)))?;
     Ok(mth(&split_records(&data)))
 }
 
-fn proof_for_file(path: &str, index: u64) -> Result<String, ProveError> {
-    let data = fs::read(path).map_err(|e| ProveError::Read(format!("cannot read '{path}': {e}")))?;
+fn proof_for_file(path: &Path, index: u64) -> Result<String, ProveError> {
+    let data = fs::read(path)
+        .map_err(|e| ProveError::Read(format!("cannot read '{}': {e}", display_path(path))))?;
     let records = split_records(&data);
     let size = records.len() as u64;
     if index >= size {
@@ -111,8 +128,10 @@ fn proof_for_file(path: &str, index: u64) -> Result<String, ProveError> {
 
 /// Parse a record index: one or more ASCII decimal digits, non-negative, no
 /// sign or whitespace, fitting in an unsigned 64-bit integer. Anything else
-/// (including "+1", " 1", "1.0", "", "-1") is rejected.
-fn parse_index(text: &str) -> Option<u64> {
+/// (including "+1", " 1", "1.0", "", "-1", or an argument that is not valid
+/// UTF-8) is rejected as a usage error.
+fn parse_index(arg: &OsStr) -> Option<u64> {
+    let text = arg.to_str()?;
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -339,6 +358,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
 
     fn hex_of(d: &[u8; 32]) -> String {
         hex(d)
@@ -544,20 +564,23 @@ mod tests {
 
     #[test]
     fn index_parsing_accepts_only_ascii_unsigned_decimal() {
-        assert_eq!(parse_index("0"), Some(0));
-        assert_eq!(parse_index("00"), Some(0));
-        assert_eq!(parse_index("123"), Some(123));
-        assert_eq!(parse_index("18446744073709551615"), Some(u64::MAX));
-        assert_eq!(parse_index("18446744073709551616"), None);
-        assert_eq!(parse_index(""), None);
-        assert_eq!(parse_index("-1"), None);
-        assert_eq!(parse_index("+1"), None);
-        assert_eq!(parse_index("1.0"), None);
-        assert_eq!(parse_index(" 1"), None);
-        assert_eq!(parse_index("1 "), None);
-        assert_eq!(parse_index("0x1"), None);
-        assert_eq!(parse_index("①"), None);
+        assert_eq!(parse_index(OsStr::new("0")), Some(0));
+        assert_eq!(parse_index(OsStr::new("00")), Some(0));
+        assert_eq!(parse_index(OsStr::new("123")), Some(123));
+        assert_eq!(parse_index(OsStr::new("18446744073709551615")), Some(u64::MAX));
+        assert_eq!(parse_index(OsStr::new("18446744073709551616")), None);
+        assert_eq!(parse_index(OsStr::new("")), None);
+        assert_eq!(parse_index(OsStr::new("-1")), None);
+        assert_eq!(parse_index(OsStr::new("+1")), None);
+        assert_eq!(parse_index(OsStr::new("1.0")), None);
+        assert_eq!(parse_index(OsStr::new(" 1")), None);
+        assert_eq!(parse_index(OsStr::new("1 ")), None);
+        assert_eq!(parse_index(OsStr::new("0x1")), None);
+        assert_eq!(parse_index(OsStr::new("①")), None);
         // Leading-zero overflow is still overflow.
-        assert_eq!(parse_index("0018446744073709551616"), None);
+        assert_eq!(parse_index(OsStr::new("0018446744073709551616")), None);
+        // An argument that is not valid UTF-8 is a usage error, never a panic.
+        assert_eq!(parse_index(OsStr::from_bytes(b"1\xff")), None);
+        assert_eq!(parse_index(OsStr::from_bytes(b"\xff")), None);
     }
 }
