@@ -651,14 +651,20 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Read a batch file exactly as the filesystem hands it over. Both `root`
+/// and `prove` go through here so the two commands can never disagree on how
+/// a file is fetched or on the wording of a read failure.
+fn read_batch(path: &Path) -> Result<Vec<u8>, String> {
+    fs::read(path).map_err(|e| format!("cannot read '{}': {e}", display_path(path)))
+}
+
 fn merkle_root_of_file(path: &Path) -> Result<[u8; 32], String> {
-    let data = fs::read(path).map_err(|e| format!("cannot read '{}': {e}", display_path(path)))?;
+    let data = read_batch(path)?;
     Ok(mth(&split_records(&data)))
 }
 
 fn proof_for_file(path: &Path, index: u64) -> Result<String, ProveError> {
-    let data = fs::read(path)
-        .map_err(|e| ProveError::Read(format!("cannot read '{}': {e}", display_path(path))))?;
+    let data = read_batch(path).map_err(ProveError::Read)?;
     let records = split_records(&data);
     let size = records.len() as u64;
     if index >= size {
@@ -740,14 +746,26 @@ fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     sha256(&input)
 }
 
+/// The single tree-construction rule shared by root computation and proof
+/// generation: a batch of `n > 1` records splits at `k`, the largest power of
+/// two strictly smaller than `n`, into the left subtree `[0..k)` and the
+/// right subtree `[k..n)`. Uneven batches keep their shape — no record is
+/// duplicated and no empty record is appended to round the size up to a
+/// power of two. Both `mth` and `root_and_path_rec` split through this
+/// function, so a batch is always carved into the same leaves and subtrees
+/// regardless of which command walks it.
+fn split_point(n: usize) -> usize {
+    debug_assert!(n > 1, "split_point is only defined for n > 1");
+    1usize << (usize::BITS - 1 - (n - 1).leading_zeros())
+}
+
 /// RFC 6962 section 2.1 Merkle Tree Hash over SHA-256.
 fn mth(leaves: &[&[u8]]) -> [u8; 32] {
     match leaves.len() {
         0 => sha256(&[]),
         1 => leaf_hash(leaves[0]),
         n => {
-            // Largest power of two strictly smaller than n.
-            let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
+            let k = split_point(n);
             node_hash(&mth(&leaves[..k]), &mth(&leaves[k..]))
         }
     }
@@ -784,8 +802,9 @@ fn root_and_path_rec(leaves: &[&[u8]], m: usize, path: &mut Vec<[u8; 32]>) -> [u
     if n == 1 {
         return leaf_hash(leaves[0]);
     }
-    // Largest power of two strictly smaller than n.
-    let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
+    // Same split as `mth`: the sibling subtree hashes pushed onto the path
+    // are exactly the subtree hashes the root computation combines.
+    let k = split_point(n);
     if m < k {
         let left = root_and_path_rec(&leaves[..k], m, path);
         let right = mth(&leaves[k..]);
