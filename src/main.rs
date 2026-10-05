@@ -10,6 +10,7 @@ const USAGE: &str = "\
 Usage:
     roottrace root <file>
     roottrace prove <file> <record-index>
+    roottrace verify <record-file> <proof-file> <trusted-tree-size> <trusted-root>
     roottrace --version
 
 Commands:
@@ -30,10 +31,24 @@ Commands:
         Example:
             roottrace prove batch.txt 0
 
+    verify <record-file> <proof-file> <trusted-tree-size> <trusted-root>
+        Verify that the complete contents of <record-file> (every byte of the
+        file, exactly as stored) form the record at the position named by the
+        inclusion proof in <proof-file> (a JSON object as printed by `prove`).
+        <trusted-tree-size> is the batch's record count as a decimal positive
+        integer and <trusted-root> its Merkle root as 64 lowercase hexadecimal
+        characters; both must be confirmed independently by the user and are
+        never taken from the proof itself. On success prints \"verified\".
+
+        Example:
+            roottrace verify record.bin proof.json 9 a8a3e76e...723adc3
+
 Exit status:
     0  success
-    1  the file cannot be read, or the record index does not exist
-    2  usage error (unknown command, missing or extra arguments, bad index)";
+    1  a file cannot be read, the record index does not exist, the proof is
+       invalid, or verification fails
+    2  usage error (unknown command, missing or extra arguments, bad index,
+       bad trusted tree size or root)";
 
 fn main() -> ExitCode {
     // Raw OS arguments: file paths are handed to the filesystem exactly as
@@ -88,6 +103,38 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        [cmd, record, proof, size, root] if cmd == OsStr::new("verify") => {
+            // The trusted tree size and root come from the user, never from
+            // the proof: both are validated as command line syntax first.
+            let trusted_size = match parse_index(size).filter(|&v| v >= 1) {
+                Some(v) => v,
+                None => {
+                    let shown = size.to_string_lossy();
+                    eprintln!("roottrace: invalid trusted tree size '{shown}': expected a decimal positive integer of ASCII digits");
+                    eprintln!("{USAGE}");
+                    return ExitCode::from(2);
+                }
+            };
+            let trusted_root = match root.to_str().and_then(|s| parse_hex_hash(s.as_bytes())) {
+                Some(r) => r,
+                None => {
+                    let shown = root.to_string_lossy();
+                    eprintln!("roottrace: invalid trusted root '{shown}': expected 64 lowercase hexadecimal characters");
+                    eprintln!("{USAGE}");
+                    return ExitCode::from(2);
+                }
+            };
+            match verify_record(Path::new(record), Path::new(proof), trusted_size, &trusted_root) {
+                Ok(()) => {
+                    println!("verified");
+                    ExitCode::SUCCESS
+                }
+                Err(reason) => {
+                    eprintln!("roottrace: {reason}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -164,6 +211,463 @@ fn proof_json(tree_size: u64, leaf_index: u64, root: &[u8; 32], audit_path: &[[u
     }
     out.push_str("]}");
     out
+}
+
+/// A parsed inclusion proof: the four required fields of the JSON object
+/// printed by `prove`, already type- and range-checked.
+struct Proof {
+    tree_size: u64,
+    leaf_index: u64,
+    root: [u8; 32],
+    audit_path: Vec<[u8; 32]>,
+}
+
+/// Verify that `record_path`'s complete byte content is the record at the
+/// position named by the proof in `proof_path`, under a tree of
+/// `trusted_size` records whose root is `trusted_root`. The trusted values
+/// come from the user (confirmed independently); the proof's own tree_size
+/// and root fields must agree with them, never replace them.
+fn verify_record(
+    record_path: &Path,
+    proof_path: &Path,
+    trusted_size: u64,
+    trusted_root: &[u8; 32],
+) -> Result<(), String> {
+    // The record file is NOT split on LF and nothing is trimmed: every byte
+    // (trailing newlines, spaces, CR, NUL, non-UTF-8 bytes) is part of the
+    // record. A zero-byte file is one empty record.
+    let record = fs::read(record_path)
+        .map_err(|e| format!("cannot read '{}': {e}", display_path(record_path)))?;
+    let proof_bytes = fs::read(proof_path)
+        .map_err(|e| format!("cannot read '{}': {e}", display_path(proof_path)))?;
+    let proof = parse_proof(&proof_bytes).map_err(|e| format!("invalid proof: {e}"))?;
+
+    if proof.tree_size != trusted_size {
+        return Err(format!(
+            "verification failed: proof tree_size {} does not match the trusted tree size {trusted_size}",
+            proof.tree_size
+        ));
+    }
+    if proof.root != *trusted_root {
+        return Err(
+            "verification failed: proof root does not match the trusted root".to_string()
+        );
+    }
+    let computed = verify_inclusion(&record, proof.leaf_index, proof.tree_size, &proof.audit_path)
+        .ok_or_else(|| {
+            format!(
+                "verification failed: audit path does not fit a tree of size {} at leaf index {}",
+                proof.tree_size, proof.leaf_index
+            )
+        })?;
+    if computed != *trusted_root {
+        return Err(
+            "verification failed: record and audit path do not hash to the trusted root"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// RFC 6962 section 2.1.1 inclusion verification: recompute the tree root
+/// from the leaf hash of `record`, the position `leaf_index` within a tree
+/// of `tree_size` records, and the sibling hashes in `audit_path` (ordered
+/// leaf to root, used exactly in that order). Returns the computed root, or
+/// `None` when the path has too few or too many hashes for the tree shape.
+/// Uneven (non power-of-two) sizes follow the same k-split tree shape as
+/// proof generation: no record is duplicated or padded in.
+fn verify_inclusion(
+    record: &[u8],
+    leaf_index: u64,
+    tree_size: u64,
+    audit_path: &[[u8; 32]],
+) -> Option<[u8; 32]> {
+    fn sub(
+        record: &[u8],
+        m: u64,
+        n: u64,
+        path: &[[u8; 32]],
+        pos: &mut usize,
+    ) -> Option<[u8; 32]> {
+        if n == 1 {
+            return Some(leaf_hash(record));
+        }
+        // Largest power of two strictly smaller than n.
+        let k = 1u64 << (u64::BITS - 1 - (n - 1).leading_zeros());
+        if m < k {
+            let left = sub(record, m, k, path, pos)?;
+            let right = *path.get(*pos)?;
+            *pos += 1;
+            Some(node_hash(&left, &right))
+        } else {
+            let right = sub(record, m - k, n - k, path, pos)?;
+            let left = *path.get(*pos)?;
+            *pos += 1;
+            Some(node_hash(&left, &right))
+        }
+    }
+    let mut pos = 0;
+    let root = sub(record, leaf_index, tree_size, audit_path, &mut pos)?;
+    if pos != audit_path.len() {
+        return None; // leftover hashes: the path is too long
+    }
+    Some(root)
+}
+
+/// Decode a 64-character lowercase hexadecimal string into 32 bytes.
+fn parse_hex_hash(text: &[u8]) -> Option<[u8; 32]> {
+    if text.len() != 64 {
+        return None;
+    }
+    let nibble = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
+        }
+    };
+    let mut out = [0u8; 32];
+    for (i, pair) in text.chunks_exact(2).enumerate() {
+        out[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(out)
+}
+
+// --- Proof JSON parsing ---
+
+/// A parsed JSON value. Numbers keep their raw token so integer-only fields
+/// can reject fractions and exponents; strings are stored unescaped.
+enum JsonValue {
+    Null,
+    Bool,
+    Number(Vec<u8>),
+    String(Vec<u8>),
+    Array(Vec<JsonValue>),
+    Object(Vec<(Vec<u8>, JsonValue)>),
+}
+
+/// Parse the proof file: one complete JSON object (any field order, any
+/// whitespace) with exactly the required fields tree_size, leaf_index, root
+/// and audit_path, each of the right type and range. Unknown extra fields
+/// are ignored; missing, duplicated or mistyped required fields are not.
+fn parse_proof(data: &[u8]) -> Result<Proof, String> {
+    let mut parser = JsonParser { data, pos: 0 };
+    parser.skip_ws();
+    let value = parser.parse_value()?;
+    parser.skip_ws();
+    if parser.pos != data.len() {
+        return Err("trailing data after the JSON object".to_string());
+    }
+    let entries = match value {
+        JsonValue::Object(entries) => entries,
+        _ => return Err("proof must be a JSON object".to_string()),
+    };
+
+    let mut tree_size = None;
+    let mut leaf_index = None;
+    let mut root = None;
+    let mut audit_path = None;
+    for (key, value) in entries {
+        let slot = match key.as_slice() {
+            b"tree_size" => &mut tree_size,
+            b"leaf_index" => &mut leaf_index,
+            b"root" => &mut root,
+            b"audit_path" => &mut audit_path,
+            _ => continue, // unknown fields are ignored
+        };
+        if slot.is_some() {
+            return Err(format!("duplicate field '{}'", String::from_utf8_lossy(&key)));
+        }
+        *slot = Some(value);
+    }
+
+    let tree_size = match tree_size {
+        Some(v) => json_u64(&v, "tree_size")?,
+        None => return Err("missing field 'tree_size'".to_string()),
+    };
+    let leaf_index = match leaf_index {
+        Some(v) => json_u64(&v, "leaf_index")?,
+        None => return Err("missing field 'leaf_index'".to_string()),
+    };
+    let root = match root {
+        Some(JsonValue::String(s)) => parse_hex_hash(&s)
+            .ok_or_else(|| "field 'root' must be 64 lowercase hexadecimal characters".to_string())?,
+        Some(_) => return Err("field 'root' must be a string".to_string()),
+        None => return Err("missing field 'root'".to_string()),
+    };
+    let audit_path = match audit_path {
+        Some(JsonValue::Array(items)) => {
+            let mut path = Vec::with_capacity(items.len());
+            for item in &items {
+                match item {
+                    JsonValue::String(s) => path.push(parse_hex_hash(s).ok_or_else(|| {
+                        "audit_path elements must be 64 lowercase hexadecimal characters"
+                            .to_string()
+                    })?),
+                    _ => return Err("audit_path elements must be strings".to_string()),
+                }
+            }
+            path
+        }
+        Some(_) => return Err("field 'audit_path' must be an array".to_string()),
+        None => return Err("missing field 'audit_path'".to_string()),
+    };
+
+    if tree_size == 0 {
+        return Err("tree_size must be at least 1".to_string());
+    }
+    if leaf_index >= tree_size {
+        return Err(format!(
+            "leaf_index {leaf_index} does not exist in a tree of size {tree_size}"
+        ));
+    }
+    Ok(Proof { tree_size, leaf_index, root, audit_path })
+}
+
+/// A required integer field: a JSON number that is a 64-bit unsigned integer
+/// (bare ASCII digits only — no sign, fraction or exponent).
+fn json_u64(value: &JsonValue, field: &str) -> Result<u64, String> {
+    let bad = || format!("field '{field}' must be a 64-bit unsigned JSON integer");
+    let token = match value {
+        JsonValue::Number(token) => token,
+        _ => return Err(bad()),
+    };
+    if token.is_empty() || !token.iter().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let mut value: u64 = 0;
+    for &b in token {
+        value = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(b - b'0')))
+            .ok_or_else(bad)?;
+    }
+    Ok(value)
+}
+
+struct JsonParser<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn err(&self, reason: &str) -> String {
+        format!("invalid JSON: {reason}")
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(&b) = self.data.get(self.pos) {
+            if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.data.get(self.pos).copied()
+    }
+
+    fn parse_value(&mut self) -> Result<JsonValue, String> {
+        match self.peek() {
+            Some(b'{') => self.parse_object(),
+            Some(b'[') => self.parse_array(),
+            Some(b'"') => Ok(JsonValue::String(self.parse_string()?)),
+            Some(b't') => self.parse_literal(b"true").map(|()| JsonValue::Bool),
+            Some(b'f') => self.parse_literal(b"false").map(|()| JsonValue::Bool),
+            Some(b'n') => self.parse_literal(b"null").map(|()| JsonValue::Null),
+            Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
+            _ => Err(self.err("expected a value")),
+        }
+    }
+
+    fn parse_literal(&mut self, literal: &[u8]) -> Result<(), String> {
+        if self.data.len() >= self.pos + literal.len()
+            && &self.data[self.pos..self.pos + literal.len()] == literal
+        {
+            self.pos += literal.len();
+            Ok(())
+        } else {
+            Err(self.err("expected a value"))
+        }
+    }
+
+    fn parse_number(&mut self) -> Result<JsonValue, String> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        match self.peek() {
+            Some(b'0') => self.pos += 1,
+            Some(b'1'..=b'9') => {
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err(self.err("malformed number")),
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(self.err("malformed number"));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(self.err("malformed number"));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        Ok(JsonValue::Number(self.data[start..self.pos].to_vec()))
+    }
+
+    fn parse_string(&mut self) -> Result<Vec<u8>, String> {
+        self.pos += 1; // opening quote
+        let mut out = Vec::new();
+        loop {
+            let b = match self.peek() {
+                Some(b) => b,
+                None => return Err(self.err("unterminated string")),
+            };
+            self.pos += 1;
+            match b {
+                b'"' => return Ok(out),
+                b'\\' => {
+                    let esc = match self.peek() {
+                        Some(e) => e,
+                        None => return Err(self.err("unterminated string")),
+                    };
+                    self.pos += 1;
+                    match esc {
+                        b'"' => out.push(b'"'),
+                        b'\\' => out.push(b'\\'),
+                        b'/' => out.push(b'/'),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0c),
+                        b'n' => out.push(b'\n'),
+                        b'r' => out.push(b'\r'),
+                        b't' => out.push(b'\t'),
+                        b'u' => {
+                            let hi = self.parse_hex4()?;
+                            let code = if (0xd800..0xdc00).contains(&hi) {
+                                // High surrogate: a low surrogate must follow.
+                                if self.peek() == Some(b'\\') {
+                                    self.pos += 1;
+                                }
+                                if self.peek() != Some(b'u') {
+                                    return Err(self.err("lone surrogate in string escape"));
+                                }
+                                self.pos += 1;
+                                let lo = self.parse_hex4()?;
+                                if !(0xdc00..0xe000).contains(&lo) {
+                                    return Err(self.err("lone surrogate in string escape"));
+                                }
+                                0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)
+                            } else {
+                                hi
+                            };
+                            match char::from_u32(code) {
+                                Some(c) => {
+                                    let mut buf = [0u8; 4];
+                                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                                }
+                                None => return Err(self.err("lone surrogate in string escape")),
+                            }
+                        }
+                        _ => return Err(self.err("invalid escape in string")),
+                    }
+                }
+                0x00..=0x1f => return Err(self.err("control character in string")),
+                _ => out.push(b),
+            }
+        }
+    }
+
+    fn parse_hex4(&mut self) -> Result<u32, String> {
+        let mut value: u32 = 0;
+        for _ in 0..4 {
+            let b = match self.peek() {
+                Some(b) => b,
+                None => return Err(self.err("truncated \\u escape")),
+            };
+            self.pos += 1;
+            let digit = match b {
+                b'0'..=b'9' => u32::from(b - b'0'),
+                b'a'..=b'f' => u32::from(b - b'a' + 10),
+                b'A'..=b'F' => u32::from(b - b'A' + 10),
+                _ => return Err(self.err("invalid \\u escape")),
+            };
+            value = (value << 4) | digit;
+        }
+        Ok(value)
+    }
+
+    fn parse_object(&mut self) -> Result<JsonValue, String> {
+        self.pos += 1; // '{'
+        let mut entries = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(JsonValue::Object(entries));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return Err(self.err("expected an object key"));
+            }
+            let key = self.parse_string()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err(self.err("expected ':' after object key"));
+            }
+            self.pos += 1;
+            self.skip_ws();
+            let value = self.parse_value()?;
+            entries.push((key, value));
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(JsonValue::Object(entries));
+                }
+                _ => return Err(self.err("expected ',' or '}' in object")),
+            }
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<JsonValue, String> {
+        self.pos += 1; // '['
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(JsonValue::Array(items));
+        }
+        loop {
+            self.skip_ws();
+            items.push(self.parse_value()?);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(JsonValue::Array(items));
+                }
+                _ => return Err(self.err("expected ',' or ']' in array")),
+            }
+        }
+    }
 }
 
 /// Split raw bytes into records on LF (0x0a). The separator is not part of
@@ -582,5 +1086,170 @@ mod tests {
         // An argument that is not valid UTF-8 is a usage error, never a panic.
         assert_eq!(parse_index(OsStr::from_bytes(b"1\xff")), None);
         assert_eq!(parse_index(OsStr::from_bytes(b"\xff")), None);
+    }
+
+    #[test]
+    fn hex_hash_parsing_accepts_only_64_lowercase_hex() {
+        let good = "a8a3e76ecf28b850e84cb5465729921212ffd07de3c0e6e170cd233bf723adc3";
+        assert!(parse_hex_hash(good.as_bytes()).is_some());
+        assert_eq!(parse_hex_hash(b""), None);
+        assert_eq!(parse_hex_hash(&good.as_bytes()[..63]), None); // too short
+        assert_eq!(parse_hex_hash(format!("{good}0").as_bytes()), None); // too long
+        assert_eq!(parse_hex_hash(good.to_uppercase().as_bytes()), None); // uppercase
+        assert_eq!(parse_hex_hash(good.replacen('a', "g", 1).as_bytes()), None); // non-hex
+    }
+
+    #[test]
+    fn verify_inclusion_roundtrips_generated_proofs_for_many_sizes() {
+        let sizes: Vec<usize> = (1..=18).chain([31, 32, 33, 100, 257]).collect();
+        for n in sizes {
+            let records: Vec<Vec<u8>> =
+                (0..n).map(|i| format!("record-{i:04}").into_bytes()).collect();
+            let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+            let root = mth(&refs);
+            for m in 0..n {
+                let (_, path) = root_and_path(&refs, m);
+                let computed = verify_inclusion(refs[m], m as u64, n as u64, &path);
+                assert_eq!(computed, Some(root), "n={n}, m={m}");
+                // A different record at the same position must not verify
+                // (unless it is byte-identical).
+                let alien = b"alien-record".as_slice();
+                if alien != refs[m] {
+                    assert_ne!(
+                        verify_inclusion(alien, m as u64, n as u64, &path),
+                        Some(root),
+                        "n={n}, m={m}: wrong record must fail"
+                    );
+                }
+                // Too few hashes: drop the last one.
+                if !path.is_empty() {
+                    assert_eq!(
+                        verify_inclusion(refs[m], m as u64, n as u64, &path[..path.len() - 1]),
+                        None,
+                        "n={n}, m={m}: truncated path must fail"
+                    );
+                }
+                // Too many hashes: append a copy of the last one (or any hash).
+                let extra = if path.is_empty() { mth(&refs) } else { path[path.len() - 1] };
+                let mut longer = path.clone();
+                longer.push(extra);
+                assert!(
+                    verify_inclusion(refs[m], m as u64, n as u64, &longer) != Some(root),
+                    "n={n}, m={m}: extended path must fail"
+                );
+                // Reordered hashes must not verify either.
+                if path.len() >= 2 {
+                    let mut swapped = path.clone();
+                    swapped.swap(0, 1);
+                    assert_ne!(
+                        verify_inclusion(refs[m], m as u64, n as u64, &swapped),
+                        Some(root),
+                        "n={n}, m={m}: reordered path must fail"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verify_inclusion_single_record_needs_empty_path() {
+        let record = b"only".as_slice();
+        let root = mth(&[record]);
+        assert_eq!(verify_inclusion(record, 0, 1, &[]), Some(root));
+        // Even one stray hash makes the proof fail.
+        assert_eq!(verify_inclusion(record, 0, 1, &[root]), None);
+    }
+
+    fn proof_bytes(json: &str) -> Result<Proof, String> {
+        parse_proof(json.as_bytes())
+    }
+
+    const ROOT_HEX: &str =
+        "a8a3e76ecf28b850e84cb5465729921212ffd07de3c0e6e170cd233bf723adc3";
+    const HASH_HEX: &str =
+        "80f3f98ae8d7d9d1d2139a6a2dc94628e02fba22e125f922ea8a4c10799cb912";
+
+    fn valid_proof_json() -> String {
+        format!(
+            "{{\"tree_size\":9,\"leaf_index\":8,\"root\":\"{ROOT_HEX}\",\"audit_path\":[\"{HASH_HEX}\"]}}"
+        )
+    }
+
+    #[test]
+    fn proof_parsing_accepts_field_order_whitespace_and_extra_fields() {
+        let proof = proof_bytes(&valid_proof_json()).unwrap();
+        assert_eq!(proof.tree_size, 9);
+        assert_eq!(proof.leaf_index, 8);
+        assert_eq!(proof.audit_path.len(), 1);
+
+        // Shuffled field order, generous whitespace, a trailing newline and
+        // unknown extra fields are all fine.
+        let fancy = format!(
+            "{{\n  \"audit_path\": [ \"{HASH_HEX}\" ],\n  \"note\": {{\"nested\": [1, \"two\", null]}},\n  \"root\": \"{ROOT_HEX}\",\n  \"leaf_index\": 8,\n  \"tree_size\": 9\n}}\n"
+        );
+        let proof = proof_bytes(&fancy).unwrap();
+        assert_eq!(proof.tree_size, 9);
+        assert_eq!(proof.leaf_index, 8);
+        assert_eq!(proof.audit_path.len(), 1);
+
+        // u64::MAX is a legitimate field value.
+        let max = format!(
+            "{{\"tree_size\":18446744073709551615,\"leaf_index\":18446744073709551614,\"root\":\"{ROOT_HEX}\",\"audit_path\":[]}}"
+        );
+        let proof = proof_bytes(&max).unwrap();
+        assert_eq!(proof.tree_size, u64::MAX);
+        assert_eq!(proof.leaf_index, u64::MAX - 1);
+    }
+
+    #[test]
+    fn proof_parsing_rejects_malformed_or_mistyped_proofs() {
+        let cases: Vec<String> = vec![
+            String::new(),                  // empty file
+            "[]".into(),                    // not an object
+            "null".into(),                  // not an object
+            "{}".into(),                    // all fields missing
+            valid_proof_json().replace("\"tree_size\":9,", ""), // missing tree_size
+            valid_proof_json().replace("\"leaf_index\":8,", ""), // missing leaf_index
+            valid_proof_json().replace(&format!("\"root\":\"{ROOT_HEX}\","), ""), // missing root
+            valid_proof_json().replace("\"audit_path\":", "\"audit_path_2\":"), // missing audit_path
+            valid_proof_json().replace("{\"tree_size\":9", "{\"tree_size\":9,\"tree_size\":9"), // duplicate
+            valid_proof_json().replace("\"leaf_index\":8", "\"leaf_index\":8,\"leaf_index\":8"), // duplicate
+            valid_proof_json().replace("\"tree_size\":9", "\"tree_size\":0"), // zero size
+            valid_proof_json().replace("\"tree_size\":9", "\"tree_size\":-9"), // negative
+            valid_proof_json().replace("\"tree_size\":9", "\"tree_size\":9.0"), // fraction
+            valid_proof_json().replace("\"tree_size\":9", "\"tree_size\":9e0"), // exponent
+            valid_proof_json().replace("\"tree_size\":9", "\"tree_size\":\"9\""), // string
+            valid_proof_json().replace("\"tree_size\":9", "\"tree_size\":18446744073709551616"), // overflow
+            valid_proof_json().replace("\"leaf_index\":8", "\"leaf_index\":9"), // index == size
+            valid_proof_json().replace("\"leaf_index\":8", "\"leaf_index\":100"), // index > size
+            valid_proof_json().replace(ROOT_HEX, &ROOT_HEX.to_uppercase()), // uppercase root
+            valid_proof_json().replace(ROOT_HEX, &ROOT_HEX[..63]), // short root
+            valid_proof_json().replace(HASH_HEX, &HASH_HEX.replacen('8', "g", 1)), // non-hex path
+            valid_proof_json().replace(&format!("\"{HASH_HEX}\""), HASH_HEX), // unquoted path element
+            valid_proof_json().replace("\"audit_path\":[", "\"audit_path\":").replace("]}", "}"), // path not an array
+            format!("{} trailing", valid_proof_json()), // trailing garbage
+            format!("{} {{}}", valid_proof_json()),     // second object
+            valid_proof_json().replacen('{', "{ ", 1) + " ", // fine actually; replaced below
+        ];
+        for (i, case) in cases.iter().enumerate() {
+            if i == cases.len() - 1 {
+                continue; // the last case is valid JSON, checked separately
+            }
+            assert!(proof_bytes(case).is_err(), "case {i} must be rejected: {case:?}");
+        }
+        // Leading whitespace and a trailing space are accepted.
+        assert!(proof_bytes(&cases[cases.len() - 1]).is_ok());
+    }
+
+    #[test]
+    fn proof_parsing_handles_json_string_escapes() {
+        // An escaped hex digit still decodes to the same hash string.
+        let escaped = valid_proof_json().replacen("\"root\":\"a", "\"root\":\"\\u0061", 1);
+        let proof = proof_bytes(&escaped).unwrap();
+        assert_eq!(proof.root, parse_hex_hash(ROOT_HEX.as_bytes()).unwrap());
+        // Unterminated strings, bad escapes and raw control bytes are invalid.
+        assert!(proof_bytes("{\"tree_size\":\"abc}").is_err());
+        assert!(proof_bytes("{\"tree_size\":\"a\\xb\"}").is_err());
+        assert!(proof_bytes("{\"tree_size\":\"a\nb\"}").is_err());
     }
 }

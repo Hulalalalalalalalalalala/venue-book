@@ -207,6 +207,53 @@ fn non_utf8_read_failures_exit_1_without_panicking() {
     }
 }
 
+/// `verify` must open record and proof files named with non-UTF-8 bytes, and
+/// must report read failures for such paths with the usual exit-1 contract.
+#[test]
+fn verify_accepts_non_utf8_record_and_proof_paths() {
+    let dir = TempDir::create();
+    let batch = dir.write(b"batch.bin", CONTENT);
+    let root_out = run(&[b"root", batch.as_os_str().as_bytes()], None);
+    assert_eq!(root_out.status.code(), Some(0));
+    let root = String::from_utf8(root_out.stdout[..64].to_vec()).unwrap();
+    let proof_out = run(&[b"prove", batch.as_os_str().as_bytes(), b"1"], None);
+    assert_eq!(proof_out.status.code(), Some(0));
+
+    // Record 1 of CONTENT is b"\x00nul-record"; proof file carries 0xff too.
+    let record = dir.write(b"record-\xff.bin", b"\x00nul-record");
+    let proof = dir.write(b"proof-\xff.json", &proof_out.stdout);
+    let out = run(
+        &[
+            b"verify".as_slice(),
+            record.as_os_str().as_bytes(),
+            proof.as_os_str().as_bytes(),
+            b"3",
+            root.as_bytes(),
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert_eq!(out.stdout, b"verified\n");
+    assert!(out.stderr.is_empty());
+
+    // A missing non-UTF-8 record path is a read failure (exit 1), not a
+    // usage error and not a panic.
+    let missing = dir.child(b"no-such-\xff-record");
+    let out = run(
+        &[
+            b"verify".as_slice(),
+            missing.as_os_str().as_bytes(),
+            proof.as_os_str().as_bytes(),
+            b"3",
+            root.as_bytes(),
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+}
+
 /// Non-UTF-8 bytes in the command name or record index are syntax errors:
 /// exit 2 with the usage text and nothing on stdout.
 #[test]
