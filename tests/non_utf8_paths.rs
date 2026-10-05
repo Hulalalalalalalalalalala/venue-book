@@ -207,6 +207,170 @@ fn non_utf8_read_failures_exit_1_without_panicking() {
     }
 }
 
+/// `verify` works end to end with 0xff-named record and proof files: the
+/// record bytes (including non-UTF-8 content) and the raw path bytes are both
+/// handled exactly. The trusted size/root are fetched through `root`, never
+/// from fields of the proof under test.
+#[test]
+fn verify_accepts_non_utf8_record_and_proof_paths_and_content() {
+    let dir = TempDir::create();
+    // CONTENT splits (LF rule) into: "alpha\r", "\x00nul-record",
+    // "\xff\xfebinary". The last record is itself non-UTF-8.
+    let batch = dir.write(b"batch-\xff.txt", CONTENT);
+
+    let root_out = run(&[b"root", batch.as_os_str().as_bytes()], None);
+    assert_eq!(root_out.status.code(), Some(0));
+    let root_line = String::from_utf8(root_out.stdout).unwrap();
+    let trusted_root = root_line.trim_end_matches('\n');
+    assert_eq!(trusted_root.len(), 64);
+
+    let proof_out = run(
+        &[b"prove", batch.as_os_str().as_bytes(), b"2"],
+        None,
+    );
+    assert_eq!(proof_out.status.code(), Some(0), "{:?}", proof_out.stderr);
+
+    // Record file and proof file both carry 0xff bytes in their names.
+    let record = dir.write(b"record-\xff.bin", b"\xff\xfebinary");
+    let proof = dir.write(b"proof-\xff.json", &proof_out.stdout);
+
+    let ok = run(
+        &[
+            b"verify",
+            record.as_os_str().as_bytes(),
+            proof.as_os_str().as_bytes(),
+            b"3",
+            trusted_root.as_bytes(),
+        ],
+        None,
+    );
+    assert_eq!(ok.status.code(), Some(0), "{:?}", ok.stderr);
+    assert_eq!(ok.stdout, b"verified\n");
+    assert!(ok.stderr.is_empty());
+
+    // An ASCII-named record file with identical bytes gives the same result.
+    let record_ascii = dir.write(b"record-ascii.bin", b"\xff\xfebinary");
+    let ok2 = run(
+        &[
+            b"verify",
+            record_ascii.as_os_str().as_bytes(),
+            proof.as_os_str().as_bytes(),
+            b"3",
+            trusted_root.as_bytes(),
+        ],
+        None,
+    );
+    assert_eq!(ok2.status.code(), Some(0), "{:?}", ok2.stderr);
+    assert_eq!(ok2.stdout, ok.stdout);
+
+    // A record file whose content differs by one byte must fail.
+    let wrong = dir.write(b"wrong-\xff.bin", b"\xff\xfebinarX");
+    let bad = run(
+        &[
+            b"verify",
+            wrong.as_os_str().as_bytes(),
+            proof.as_os_str().as_bytes(),
+            b"3",
+            trusted_root.as_bytes(),
+        ],
+        None,
+    );
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(bad.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("verification failed"));
+}
+
+/// Missing or directory inputs for `verify` with 0xff bytes keep the stable
+/// read-failure contract: exit 1, empty stdout, a stderr reason, no panic.
+#[test]
+fn verify_non_utf8_read_failures_exit_1_without_panicking() {
+    let dir = TempDir::create();
+    let batch = dir.write(b"batch-\xff.txt", CONTENT);
+    let root_out = run(&[b"root", batch.as_os_str().as_bytes()], None);
+    let trusted_root = String::from_utf8(root_out.stdout).unwrap().trim_end().to_string();
+    let proof_out = run(&[b"prove", batch.as_os_str().as_bytes(), b"0"], None);
+    let proof = dir.write(b"proof-\xff.json", &proof_out.stdout);
+    let record = dir.write(b"record-\xff.bin", b"alpha\r");
+
+    let missing_rec = dir.child(b"no-record-\xff.bin");
+    for args in [
+        vec![
+            b"verify".as_slice(),
+            missing_rec.as_os_str().as_bytes(),
+            proof.as_os_str().as_bytes(),
+            b"3",
+            trusted_root.as_bytes(),
+        ],
+    ] {
+        let out = run(&args, None);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty());
+        assert!(!out.stderr.is_empty());
+    }
+
+    let sub = dir.child(b"dir-\xff");
+    fs::create_dir(&sub).unwrap();
+    let out = run(
+        &[
+            b"verify",
+            sub.as_os_str().as_bytes(),
+            proof.as_os_str().as_bytes(),
+            b"3",
+            trusted_root.as_bytes(),
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+
+    // A directory in the proof path position likewise fails at read time.
+    let out = run(
+        &[
+            b"verify",
+            record.as_os_str().as_bytes(),
+            sub.as_os_str().as_bytes(),
+            b"3",
+            trusted_root.as_bytes(),
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+}
+
+/// Non-UTF-8 bytes in the command name or in the trusted size/root arguments
+/// are syntax errors: exit 2 with the usage text and nothing on stdout.
+#[test]
+fn non_utf8_verify_arguments_are_usage_errors() {
+    let dir = TempDir::create();
+    let record = dir.write(b"record-\xff.bin", b"alpha\r");
+    let proof = dir.write(b"proof-\xff.json", b"{}");
+    let rec_bytes = record.as_os_str().as_bytes();
+    let prf_bytes = proof.as_os_str().as_bytes();
+
+    let bad_cmd = run(&[b"ver\xffy", rec_bytes, prf_bytes, b"3", b"a"], None);
+    assert_eq!(bad_cmd.status.code(), Some(2));
+    assert!(bad_cmd.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&bad_cmd.stderr).contains("Usage"));
+
+    for bad_size in [b"3\xff".as_slice(), b"\xff"] {
+        let out = run(&[b"verify", rec_bytes, prf_bytes, bad_size, b"a"], None);
+        assert_eq!(out.status.code(), Some(2), "size {bad_size:?}");
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Usage"));
+    }
+
+    // A trusted root carrying a raw 0xff byte is not a 64-hex string.
+    let mut bad_root = vec![b'a'; 64];
+    bad_root[0] = 0xff;
+    let out = run(&[b"verify", rec_bytes, prf_bytes, b"3", &bad_root], None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Usage"));
+}
+
 /// Non-UTF-8 bytes in the command name or record index are syntax errors:
 /// exit 2 with the usage text and nothing on stdout.
 #[test]
