@@ -105,8 +105,7 @@ fn proof_for_file(path: &str, index: u64) -> Result<String, ProveError> {
         return Err(ProveError::Missing(index, size));
     }
     let idx = index as usize;
-    let root = mth(&records);
-    let audit_path = inclusion_path(&records, idx);
+    let (root, audit_path) = root_and_path(&records, idx);
     Ok(proof_json(size, index, &root, &audit_path))
 }
 
@@ -162,32 +161,43 @@ fn split_records(data: &[u8]) -> Vec<&[u8]> {
     records
 }
 
+/// RFC 6962 section 2.1 leaf hash: SHA-256(0x00 || data).
+fn leaf_hash(data: &[u8]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(1 + data.len());
+    input.push(0x00);
+    input.extend_from_slice(data);
+    sha256(&input)
+}
+
+/// RFC 6962 section 2.1 interior node hash: SHA-256(0x01 || left || right).
+fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(65);
+    input.push(0x01);
+    input.extend_from_slice(left);
+    input.extend_from_slice(right);
+    sha256(&input)
+}
+
 /// RFC 6962 section 2.1 Merkle Tree Hash over SHA-256.
 fn mth(leaves: &[&[u8]]) -> [u8; 32] {
     match leaves.len() {
         0 => sha256(&[]),
-        1 => {
-            let mut input = Vec::with_capacity(1 + leaves[0].len());
-            input.push(0x00);
-            input.extend_from_slice(leaves[0]);
-            sha256(&input)
-        }
+        1 => leaf_hash(leaves[0]),
         n => {
             // Largest power of two strictly smaller than n.
             let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
-            let left = mth(&leaves[..k]);
-            let right = mth(&leaves[k..]);
-            let mut input = Vec::with_capacity(65);
-            input.push(0x01);
-            input.extend_from_slice(&left);
-            input.extend_from_slice(&right);
-            sha256(&input)
+            node_hash(&mth(&leaves[..k]), &mth(&leaves[k..]))
         }
     }
 }
 
-/// RFC 6962 section 2.1.1 Merkle Audit Path for the record at `m` within a
-/// batch of `n` records, ordered from the leaf level up to the root.
+/// RFC 6962 section 2.1.1: the Merkle Tree Hash of the whole batch together
+/// with the Merkle Audit Path for the record at `m`, computed in a single
+/// traversal. Every leaf hash and every subtree hash is computed exactly
+/// once: each interior hash on the path from the leaf to the root feeds both
+/// the root computation and (for the sibling subtree) the audit path, so
+/// producing a proof never rehashes a record byte or a subtree that already
+/// contributed to the root.
 ///
 /// ```text
 /// PATH(m, [d0]) = []
@@ -197,28 +207,33 @@ fn mth(leaves: &[&[u8]]) -> [u8; 32] {
 ///
 /// with k the largest power of two strictly smaller than n. Uneven batches
 /// are handled by the recursion itself: no leaf is duplicated and no empty
-/// record is appended to round the size up to a power of two.
-fn inclusion_path(leaves: &[&[u8]], m: usize) -> Vec<[u8; 32]> {
+/// record is appended to round the size up to a power of two. The returned
+/// path is ordered from the leaf level up to the root.
+fn root_and_path(leaves: &[&[u8]], m: usize) -> ([u8; 32], Vec<[u8; 32]>) {
     let n = leaves.len();
     assert!(m < n, "leaf index {m} out of range for {n} record(s)");
     let mut path = Vec::new();
-    inclusion_path_rec(leaves, m, &mut path);
-    path
+    let root = root_and_path_rec(leaves, m, &mut path);
+    (root, path)
 }
 
-fn inclusion_path_rec(leaves: &[&[u8]], m: usize, path: &mut Vec<[u8; 32]>) {
+fn root_and_path_rec(leaves: &[&[u8]], m: usize, path: &mut Vec<[u8; 32]>) -> [u8; 32] {
     let n = leaves.len();
     if n == 1 {
-        return;
+        return leaf_hash(leaves[0]);
     }
     // Largest power of two strictly smaller than n.
     let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
     if m < k {
-        inclusion_path_rec(&leaves[..k], m, path);
-        path.push(mth(&leaves[k..]));
+        let left = root_and_path_rec(&leaves[..k], m, path);
+        let right = mth(&leaves[k..]);
+        path.push(right);
+        node_hash(&left, &right)
     } else {
-        inclusion_path_rec(&leaves[k..], m - k, path);
-        path.push(mth(&leaves[..k]));
+        let left = mth(&leaves[..k]);
+        let right = root_and_path_rec(&leaves[k..], m - k, path);
+        path.push(left);
+        node_hash(&left, &right)
     }
 }
 
@@ -233,6 +248,14 @@ fn hex(digest: &[u8; 32]) -> String {
 
 // --- SHA-256 (FIPS 180-4) ---
 
+// Test-only instrumentation: counts sha256 invocations on the current thread
+// (each test runs on its own thread) so a test can pin down exactly how many
+// hashes a proof generation performs.
+#[cfg(test)]
+thread_local! {
+    static SHA256_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -245,6 +268,8 @@ const K: [u32; 64] = [
 ];
 
 fn sha256(data: &[u8]) -> [u8; 32] {
+    #[cfg(test)]
+    SHA256_CALLS.with(|c| c.set(c.get() + 1));
     let mut h: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
@@ -317,21 +342,6 @@ mod tests {
 
     fn hex_of(d: &[u8; 32]) -> String {
         hex(d)
-    }
-
-    /// Leaf hash: SHA-256(0x00 || data).
-    fn leaf_hash(data: &[u8]) -> [u8; 32] {
-        let mut input = vec![0x00];
-        input.extend_from_slice(data);
-        sha256(&input)
-    }
-
-    fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-        let mut input = Vec::with_capacity(65);
-        input.push(0x01);
-        input.extend_from_slice(left);
-        input.extend_from_slice(right);
-        sha256(&input)
     }
 
     /// Verify an RFC 6962 inclusion proof with the RFC's recursive verifier:
@@ -434,7 +444,12 @@ mod tests {
             let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
             let root = mth(&refs);
             for m in 0..n {
-                let path = inclusion_path(&refs, m);
+                let (fused_root, path) = root_and_path(&refs, m);
+                assert_eq!(
+                    hex_of(&fused_root),
+                    hex_of(&root),
+                    "single-pass root must equal mth at n={n}, m={m}"
+                );
                 if n == 1 {
                     assert!(path.is_empty(), "single record must have an empty path");
                 } else {
@@ -454,11 +469,36 @@ mod tests {
     }
 
     #[test]
+    fn proof_generation_hashes_every_leaf_and_subtree_exactly_once() {
+        // A batch of n records has n leaf hashes and n - 1 interior node
+        // hashes. Computing the root and one audit path in a single pass must
+        // cost exactly 2n - 1 SHA-256 invocations: the old two-phase
+        // implementation (mth for the root, then inclusion_path recomputing
+        // the sibling subtrees) needed strictly more for any n >= 2.
+        for n in [1usize, 2, 3, 4, 5, 8, 9, 10, 16, 33] {
+            let records: Vec<Vec<u8>> = (0..n).map(|i| format!("record-{i:04}").into_bytes()).collect();
+            let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+            for m in 0..n {
+                SHA256_CALLS.with(|c| c.set(0));
+                let _ = root_and_path(&refs, m);
+                let calls = SHA256_CALLS.with(|c| c.get());
+                assert_eq!(
+                    calls,
+                    2 * n - 1,
+                    "n={n}, m={m}: expected {n} leaf + {} interior hashes, each computed once",
+                    n - 1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn single_record_audit_path_is_empty_but_fields_still_present() {
         let records = [b"only".as_slice()];
-        let path = inclusion_path(&records, 0);
+        let (root, path) = root_and_path(&records, 0);
         assert!(path.is_empty());
-        let json = proof_json(1, 0, &mth(&records), &path);
+        assert_eq!(hex_of(&root), hex_of(&mth(&records)));
+        let json = proof_json(1, 0, &root, &path);
         assert_eq!(
             json,
             format!(
@@ -475,8 +515,10 @@ mod tests {
         let refs: Vec<&[u8]> = vec![b"x", b"a", b"b", b"c", b"x", b"d", b"e"];
         let n = refs.len();
         let root = mth(&refs);
-        let p0 = inclusion_path(&refs, 0);
-        let p4 = inclusion_path(&refs, 4);
+        let (root0, p0) = root_and_path(&refs, 0);
+        let (root4, p4) = root_and_path(&refs, 4);
+        assert_eq!(hex_of(&root0), hex_of(&root));
+        assert_eq!(hex_of(&root4), hex_of(&root));
         assert_ne!(p0, p4, "equal content at different positions needs different proofs");
         assert_eq!(hex_of(&verify_proof(b"x", 0, n, &p0)), hex_of(&root));
         assert_eq!(hex_of(&verify_proof(b"x", 4, n, &p4)), hex_of(&root));
@@ -493,7 +535,8 @@ mod tests {
         let owned: Vec<Vec<u8>> = (0..5).map(|i| vec![b'a' + i as u8]).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
         let root = mth(&refs);
-        let path = inclusion_path(&refs, 4);
+        let (fused_root, path) = root_and_path(&refs, 4);
+        assert_eq!(hex_of(&fused_root), hex_of(&root));
         assert_eq!(path.len(), 1);
         assert_eq!(path[0], mth(&refs[..4]), "the one sibling is MTH(d0..d3)");
         assert_eq!(hex_of(&verify_proof(refs[4], 4, 5, &path)), hex_of(&root));
