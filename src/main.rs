@@ -740,26 +740,22 @@ fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     sha256(&input)
 }
 
-/// RFC 6962 section 2.1 Merkle Tree Hash over SHA-256.
-fn mth(leaves: &[&[u8]]) -> [u8; 32] {
-    match leaves.len() {
-        0 => sha256(&[]),
-        1 => leaf_hash(leaves[0]),
-        n => {
-            // Largest power of two strictly smaller than n.
-            let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
-            node_hash(&mth(&leaves[..k]), &mth(&leaves[k..]))
-        }
-    }
-}
-
-/// RFC 6962 section 2.1.1: the Merkle Tree Hash of the whole batch together
-/// with the Merkle Audit Path for the record at `m`, computed in a single
-/// traversal. Every leaf hash and every subtree hash is computed exactly
-/// once: each interior hash on the path from the leaf to the root feeds both
-/// the root computation and (for the sibling subtree) the audit path, so
-/// producing a proof never rehashes a record byte or a subtree that already
-/// contributed to the root.
+/// Construct the RFC 6962 Merkle tree over a batch. This is the SINGLE place
+/// that maintains the tree-construction rules: both `root` (via `mth`) and
+/// `prove` (via `root_and_path`) build their leaves and subtrees here, so the
+/// two commands can never disagree on how a batch is shaped or hashed.
+///
+/// ```text
+/// MTH([])      = SHA-256("")
+/// MTH([d])     = SHA-256(0x00 || d)
+/// MTH(d0..dn)  = SHA-256(0x01 || MTH(d0..dk) || MTH(dk..dn))
+/// ```
+///
+/// with k the largest power of two strictly smaller than n. Uneven batches
+/// are handled by the recursion itself: no leaf is duplicated and no empty
+/// record is appended to round the size up to a power of two.
+///
+/// `target` selects the one leaf a membership proof is built for:
 ///
 /// ```text
 /// PATH(m, [d0]) = []
@@ -767,36 +763,71 @@ fn mth(leaves: &[&[u8]]) -> [u8; 32] {
 ///                       = PATH(m, [dk..d(n-1)]) + MTH([d0..d(k-1)])   if m >= k
 /// ```
 ///
-/// with k the largest power of two strictly smaller than n. Uneven batches
-/// are handled by the recursion itself: no leaf is duplicated and no empty
-/// record is appended to round the size up to a power of two. The returned
-/// path is ordered from the leaf level up to the root.
+/// When `target` is `Some(m)`, the sibling subtree hashes on the route from
+/// leaf `m` to the root are appended to `path` in leaf-to-root order
+/// (RFC 6962 section 2.1.1); the reindexed `Some(m - k)` follows the audited
+/// leaf into whichever subtree contains it, while the sibling subtree is
+/// built with `None`. With `None` only the root is built. Every leaf hash and
+/// every interior hash is computed exactly once in either mode, so producing
+/// a proof costs the same 2n - 1 SHA-256 invocations as the root alone.
+fn build_tree(
+    leaves: &[&[u8]],
+    target: Option<usize>,
+    path: &mut Vec<[u8; 32]>,
+) -> [u8; 32] {
+    match leaves.len() {
+        0 => sha256(&[]),
+        1 => leaf_hash(leaves[0]),
+        n => {
+            // Largest power of two strictly smaller than n.
+            let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
+            let (left_leaves, right_leaves) = leaves.split_at(k);
+            match target {
+                // The audited leaf is in the left subtree; the right subtree
+                // hash is this level's sibling on the leaf-to-root path.
+                Some(m) if m < k => {
+                    let left = build_tree(left_leaves, Some(m), path);
+                    let right = build_tree(right_leaves, None, path);
+                    path.push(right);
+                    node_hash(&left, &right)
+                }
+                // The audited leaf is in the right subtree; reindex it
+                // relative to that subtree and take the left subtree as the
+                // sibling.
+                Some(m) => {
+                    let left = build_tree(left_leaves, None, path);
+                    let right = build_tree(right_leaves, Some(m - k), path);
+                    path.push(left);
+                    node_hash(&left, &right)
+                }
+                // No audited leaf: both subtrees are plain root constructions.
+                None => {
+                    let left = build_tree(left_leaves, None, path);
+                    let right = build_tree(right_leaves, None, path);
+                    node_hash(&left, &right)
+                }
+            }
+        }
+    }
+}
+
+/// RFC 6962 section 2.1 Merkle Tree Hash over SHA-256: the batch root, built
+/// by the shared `build_tree` constructor so it follows exactly the same
+/// rules as proof generation.
+fn mth(leaves: &[&[u8]]) -> [u8; 32] {
+    build_tree(leaves, None, &mut Vec::new())
+}
+
+/// RFC 6962 section 2.1.1: the Merkle Tree Hash of the whole batch together
+/// with the Merkle Audit Path for the record at `m`, both produced by the
+/// shared `build_tree` constructor. The returned path is ordered from the
+/// leaf level up to the root and is empty for a batch of exactly one record.
 fn root_and_path(leaves: &[&[u8]], m: usize) -> ([u8; 32], Vec<[u8; 32]>) {
     let n = leaves.len();
     assert!(m < n, "leaf index {m} out of range for {n} record(s)");
     let mut path = Vec::new();
-    let root = root_and_path_rec(leaves, m, &mut path);
+    let root = build_tree(leaves, Some(m), &mut path);
     (root, path)
-}
-
-fn root_and_path_rec(leaves: &[&[u8]], m: usize, path: &mut Vec<[u8; 32]>) -> [u8; 32] {
-    let n = leaves.len();
-    if n == 1 {
-        return leaf_hash(leaves[0]);
-    }
-    // Largest power of two strictly smaller than n.
-    let k = 1usize << (usize::BITS - 1 - (n - 1).leading_zeros());
-    if m < k {
-        let left = root_and_path_rec(&leaves[..k], m, path);
-        let right = mth(&leaves[k..]);
-        path.push(right);
-        node_hash(&left, &right)
-    } else {
-        let left = mth(&leaves[..k]);
-        let right = root_and_path_rec(&leaves[k..], m - k, path);
-        path.push(left);
-        node_hash(&left, &right)
-    }
 }
 
 fn hex(digest: &[u8; 32]) -> String {
