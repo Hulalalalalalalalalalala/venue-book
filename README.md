@@ -74,6 +74,16 @@ ASCII 十进制正整数且不超 64 位）或可信根值（恰为 64 位小写
 变体，确认长记录在批次中与单条记录时遵守同一标准。所有长记录批次都同时以
 "末尾有/无结束用 LF"两种文件形式校验，二者表示同一记录序列、根值相同。
 
+`tests/library_verify.rs` 把 roottrace 当作**库**来端到端检验：证明与可信根值由
+实际构建出的 CLI（`prove`/`root`）产生，大树情形沿用与
+`tests/verify_big_tree_regression.rs` 相同的固定常量，核验本身则全部通过
+`roottrace::verify_membership` 在内存中完成。覆盖：CLI 证明在批次每个位置都能
+经库核验成功，且返回的类型化结果携带来自证明的序号与调用方的可信树大小、
+根值；格式无效、核验失败、可信树大小为零（调用参数无效）三类错误按类型
+区分；记录字节保真（空记录、末尾 LF/CR/空格/NUL、非 UTF-8 字节）；字段重排、
+空白与等价转义被接受而重复字段仍被拒绝；重复内容只按声明位置核验；2^63、
+2^63+1、2^64-1 的树大小与超过 32 位的序号保持完整 64 位含义。
+
 `tests/verify_big_tree_regression.rs` 对**大树**（树大小接近 64 位无符号整数上限）
 的核验做端到端保障：树大小为 9223372036854775808（2^63，二次幂树）、
 9223372036854775809（2^63+1，不均匀树）与 18446744073709551615（2^64-1，不均匀
@@ -276,3 +286,59 @@ JSON 整数（负数、小数、指数、前导零、超范围如 `1e400` 等都
 ```text
 roottrace 0.1.0
 ```
+
+## 作为 Rust 库调用
+
+除命令行外，roottrace 同时是一个 Rust 库：其他 Rust 程序可以直接在内存中
+核验成员证明，无需准备完整批次或临时文件。在 `Cargo.toml` 中把本包加入
+`[dependencies]` 后，使用唯一的入口 `roottrace::verify_membership`：
+
+```rust
+use roottrace::{verify_membership, VerifyError};
+
+// 1. 目标记录的全部原始字节（空切片表示一条空记录；末尾 LF/CR/空格、
+//    NUL、非 UTF-8 字节都属于内容，不按批次文件的 LF 规则切分）。
+let record: &[u8] = b"some record bytes";
+// 2. 证明 JSON 的原始字节（例如 `roottrace prove` 的输出；字段重排、
+//    合法空白与等价字符串转义都被接受）。
+let proof: &[u8] = br#"{"tree_size":9,"leaf_index":3,"root":"a8a3...dc3","audit_path":["..."]}"#;
+// 3. 独立确认的可信值：树大小（u64，必须为正）和 32 字节根值。
+let trusted_tree_size: u64 = 9;
+let trusted_root: [u8; 32] = [0xa8, 0xa3, /* ...来自可信渠道的 32 字节... */ 0xc3];
+
+match verify_membership(record, proof, trusted_tree_size, &trusted_root) {
+    Ok(membership) => {
+        // 核验成功：记录确实位于证明声明的位置。
+        println!("位置 {}", membership.leaf_index());   // 从 0 开始的记录序号
+        println!("树大小 {}", membership.tree_size());  // 即你的可信树大小
+        println!("根值 {:?}", membership.root());       // 即你的可信根值
+    }
+    Err(VerifyError::MalformedProof(reason)) => {
+        // 证明格式无效：不是合法的证明 JSON（字段缺失/重复、整数或哈希
+        // 不合法、对象后有多余字节等）。
+        eprintln!("证明格式无效: {reason}");
+    }
+    Err(VerifyError::VerificationFailed(reason)) => {
+        // 证明格式合法，但记录内容、可信树大小、可信根值或审计路径不匹配。
+        eprintln!("核验失败: {reason}");
+    }
+    Err(VerifyError::InvalidTrustedSize) => {
+        // 调用参数无效：可信树大小为 0。不存在包含记录的零节点树，
+        // 不会被当作"空树中的成员证明"接受。
+        eprintln!("可信树大小必须为正整数");
+    }
+}
+```
+
+**可信值必须独立确认。** 与 `verify` 命令一样，证明自带的 `tree_size` 和
+`root` 只用于和你提供的可信值比对，绝不作为信任依据；可信值应来自签名
+公告、带外账本，或对完整批次自行运行 `roottrace root` 等渠道。成功结果
+`Membership` 的 `tree_size()` 和 `root()` 返回的就是你传入并已核对一致
+的可信值，`leaf_index()` 是证明声明的（从 0 开始的）位置——相同内容出现
+在其他位置不能替代这个位置。树大小和序号始终保持完整 64 位含义，即使
+超过平台的指针宽度也不会被截断。
+
+库本身不向标准输出或标准错误打印任何内容；成功与失败的展示方式完全由
+调用方决定。失败时只返回上述错误，不会返回任何表示已核验成功的结果。
+命令行的 `verify` 子命令与库函数走完全相同的核验代码，两边对同一输入的
+结论一致。
