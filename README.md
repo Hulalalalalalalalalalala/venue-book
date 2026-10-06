@@ -276,3 +276,116 @@ JSON 整数（负数、小数、指数、前导零、超范围如 `1e400` 等都
 ```text
 roottrace 0.1.0
 ```
+
+## 在其他 Rust 程序中直接核验（库入口）
+
+除命令行外，roottrace 也是一个 Rust 库。其他 Rust 程序可以把一条记录、
+JSON 证明和自己独立确认的树大小/根值直接放在内存中核验，无需准备完整
+批次，也不需要写任何临时文件；库本身不做任何 I/O，也不打印提示或错误
+说明，结果如何展示完全由调用方决定。
+
+入口函数（与 `roottrace verify` 命令执行同一套核验规则）：
+
+```rust
+pub fn verify_inclusion(
+    record: &[u8],
+    proof: &[u8],
+    trusted_tree_size: u64,
+    trusted_root: &[u8; 32],
+) -> Result<VerifiedInclusion, VerifyInclusionError>
+```
+
+各参数含义：
+
+- **`record`**：目标记录的**全部原始字节**。整个切片就是记录内容，不按 LF
+  切分，也不去掉末尾的 LF、CR、空格或 NUL；非 UTF-8 字节原样参与哈希；
+  空切片 `&[]` 表示一条**空记录**。这与记录文件的逐字节规则一致，但数据
+  直接来自内存。
+- **`proof`**：一个完整 JSON 证明对象的原始字节，即 `roottrace prove` 输出
+  的那种 JSON。字段重排、合法 JSON 空白（空格、制表符、CR、LF）以及等价
+  的字符串转义（如 `\uXXXX`）照常接受；重复字段、不合法的整数（负数、
+  小数、指数、前导零、超出 64 位无符号范围，包括 `1e400`）、不合法的哈希
+  （非 64 个小写十六进制字符）等仍按原规则拒绝。
+- **`trusted_tree_size`**：调用方**独立确认**的可信树大小，`u64`。必须非
+  零：传 `0` 返回参数无效错误，零大小的树不可能包含任何记录，不会被当成
+  “空树中的成员证明”接受。
+- **`trusted_root`**：调用方**独立确认**的可信根值，32 字节哈希（如
+  `[u8; 32]` 的引用）。证明里的 `tree_size`/`root` 只用于与这两个可信值
+  比对，**绝不能**从证明里读出可信值。
+
+**成功结果 `VerifiedInclusion`** 只在全部核对通过后返回，可直接读取：
+
+- `leaf_index() -> u64`：记录被绑定的位置，从 0 开始，正是证明声明的那个
+  位置；相同内容在其他位置出现不能替代它（不会搜索其他位置）。
+- `tree_size() -> u64`：核验所用的树大小，已确认等于调用方给的可信大小
+  （也等于证明自带的 `tree_size`），不是仅从证明中读出的值。
+- `root() -> [u8; 32]` / `root_bytes() -> &[u8; 32]`：核验所用的根值，已
+  确认等于调用方给的可信根值。
+
+**失败类型 `VerifyInclusionError`** 让调用方按类型区分三类情况：
+
+| 变体 | 含义 |
+| --- | --- |
+| `InvalidProof` | 证明无法按现有格式解读（非 JSON 对象、必需字段缺失或重复、类型错误、非法整数/哈希、`tree_size` 为 0、`leaf_index` 越界、对象后有多余字节等）。 |
+| `VerificationFailed` | 证明格式合法，但内容、可信大小、可信根或路径不匹配（记录字节不符、证明的 `tree_size`/`root` 与可信值不一致、路径缺一个/多一个/顺序错误、单记录树带非空路径等）。 |
+| `InvalidArgument` | 调用方自己的参数无效，目前只有可信树大小为 `0` 这一种；此时不会去解读证明，也绝不可能返回成功结果。 |
+
+该枚举实现了 `std::error::Error`（带有简短的 `Display` 文案），并标记为
+`#[non_exhaustive]`，将来可能新增错误类别；在独立 crate 中匹配时建议保留
+一个通配分支。树大小与序号全程按 64 位无符号整数处理，即使平台的索引宽度
+只有 32 位也不会截断。
+
+最小示例：
+
+```rust
+use roottrace::{verify_inclusion, VerifyInclusionError};
+
+fn main() {
+    // 实际程序中，记录与证明可来自网络或内存；这里直接给出字面量。
+    let record: &[u8] = b"the exact record bytes";
+    let proof_json: &[u8] = br#"{"tree_size":9,"leaf_index":4,"root":"...64 个小写十六进制字符...","audit_path":["..."]}"#;
+
+    // 来自带外可信渠道（签名公告、独立账本等），而不是从 proof_json 里复制。
+    let trusted_tree_size: u64 = 9;
+    let trusted_root: [u8; 32] = trusted_root_from_out_of_band();
+
+    match verify_inclusion(record, proof_json, trusted_tree_size, &trusted_root) {
+        Ok(v) => {
+            // 只有到这里，v 中的位置/大小/根值才是已核验的事实。
+            println!(
+                "记录位于序号 {}，树大小 {}，根值 {:02x?}",
+                v.leaf_index(),
+                v.tree_size(),
+                v.root(),
+            );
+        }
+        Err(VerifyInclusionError::InvalidProof) => {
+            // 证明格式无效：调用方自行决定如何提示。
+        }
+        Err(VerifyInclusionError::VerificationFailed) => {
+            // 格式合法但核验不通过。
+        }
+        Err(other) => {
+            // InvalidArgument（如可信树大小为 0）以及将来新增的类别。
+            eprintln!("参数无效或其他错误: {other}");
+        }
+    }
+}
+
+fn trusted_root_from_out_of_band() -> [u8; 32] {
+    // ...以你自己的方式取得并确认 32 字节根值...
+    [0u8; 32]
+}
+```
+
+在自己的 `Cargo.toml` 中按路径或 git 依赖加入本 crate 即可调用上述接口；
+`root`、`prove`、`verify` 与 `--version` 命令的用法、输出与错误分类不受
+影响。`tests/library_verify.rs` 以外部 crate 的方式对该库入口做回归保障：
+成功时返回的位置/大小/根值均为已核对值；空字节序列是空记录，末尾
+LF/CR/空格/NUL 与非 UTF-8 字节都参与核验；零可信大小是参数错误（即使证明
+本身是乱码也不解读）；格式错误与核验失败分别落到不同类型；字段重排、空白
+与等价转义接受，重复字段（含用 `\uXXXX` 拼出同名键）、非法整数与哈希拒绝；
+单记录树只接受空路径；相同内容不能顶替其他位置；树大小/序号在 2^63、
+2^63+1、2^64-1 等边界保持精确 64 位含义（使用与大树命令行回归相同的独立
+参考常量）。
+
