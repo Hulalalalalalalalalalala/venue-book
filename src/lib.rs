@@ -22,6 +22,10 @@
 //! 里读出的字段。失败按类型区分为 [`VerifyError`] 的三个变体，库本身不向
 //! 标准输出或标准错误打印任何内容，展示方式由调用方决定。
 //!
+//! 如果只想查看证明自身声明的大小、序号和根值，而没有目标记录与独立可信
+//! 值，请改用 [`inspect_proof`]：它做同样的完整格式解读，但不做成员核验，
+//! 其结果 [`ProofClaims`] 中的大小与根值直接来自证明、不可当作可信输入。
+//!
 //! # 示例
 //!
 //! ```
@@ -151,11 +155,87 @@ pub fn verify_membership(
     })
 }
 
+/// 解读一份成员证明后、**未经任何核验**的声明值：`inspect` 操作的结果。
+///
+/// 与 [`Membership`] 不同，这里的树大小和根值直接来自证明自身的字段，没有
+/// 与任何独立可信值比对，也没有目标记录可供重算路径。它们只表示“证明声称
+/// 如此”，绝不表示记录已被证明属于该批次——即使审计路径的哈希数量、顺序或
+/// 内容根本无法把任何记录结合到该根值，只要证明格式合法，这些字段仍会被
+/// 原样读出。调用方不得把这里的 `tree_size()`/`root()` 当作
+/// [`verify_membership`] 的可信输入。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofClaims {
+    tree_size: u64,
+    leaf_index: u64,
+    root: [u8; 32],
+}
+
+impl ProofClaims {
+    /// 证明声明的树大小（证明中的 `tree_size` 字段），保持完整 64 位无符号
+    /// 整数含义。该值未经验证，不是独立确认的可信树大小。
+    pub fn tree_size(&self) -> u64 {
+        self.tree_size
+    }
+
+    /// 证明声明的记录序号（证明中的 `leaf_index` 字段），从 0 开始。格式
+    /// 合法时必有 `0 <= leaf_index < tree_size`，但该位置上是否确有该记录
+    /// 并未核验。
+    pub fn leaf_index(&self) -> u64 {
+        self.leaf_index
+    }
+
+    /// 证明声明的根值（证明中的 `root` 字段）。该值直接取自证明，未经
+    /// 独立确认，不是可信根值。
+    pub fn root(&self) -> &[u8; 32] {
+        &self.root
+    }
+}
+
+/// 解读证明失败：证明字节不符合当前的完整证明格式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InspectError {
+    /// 证明格式无效，判定标准与核验路径完全相同——不是完整 JSON 对象、
+    /// 必需字段（含不展示的 `audit_path`）缺失/重复/类型错误、整数或哈希
+    /// 不合法、`tree_size` 为 0、序号越界、对象后有多余字节等。附带人类
+    /// 可读的原因说明。
+    MalformedProof(String),
+}
+
+impl fmt::Display for InspectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InspectError::MalformedProof(reason) => write!(f, "invalid proof: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for InspectError {}
+
+/// 解读一份成员证明，取出它声明的树大小、记录序号与根值，**不做成员核验**。
+///
+/// 解读使用与 [`verify_membership`] 完全相同的完整格式判定：证明必须是一个
+/// 完整的 JSON 对象，四个必需字段齐全且无重复，类型、整数与哈希合法，
+/// `tree_size` 为正且 `leaf_index` 在声明范围内——即使损坏发生在不展示的
+/// `audit_path` 中（哈希长度不对、数组未结束等）也按格式无效拒绝。字段重排、
+/// 合法 JSON 空白与等价 Unicode 转义不影响解读结果。
+///
+/// 成功只代表证明符合当前格式：没有目标记录、没有独立可信值，因此既不检查
+/// 审计路径能否证明声明的位置，也不返回任何表示核验成功的结论。需要确认
+/// 成员身份时请改用 [`verify_membership`]。
+pub fn inspect_proof(proof: &[u8]) -> Result<ProofClaims, InspectError> {
+    let proof = parse_proof(proof).map_err(InspectError::MalformedProof)?;
+    Ok(ProofClaims {
+        tree_size: proof.tree_size,
+        leaf_index: proof.leaf_index,
+        root: proof.root,
+    })
+}
+
 // --- 供命令行程序复用的内部实现 ------------------------------------------------
 //
 // 以下项是 `roottrace` 命令行程序（src/main.rs）与库共享的实现细节，不属于
-// 稳定的库 API，故对文档隐藏。命令行的 root/prove/verify 子命令与库函数走
-// 完全相同的代码路径，保证两边结果一致。
+// 稳定的库 API，故对文档隐藏。命令行的 root/prove/verify/inspect 子命令与库
+// 函数走完全相同的代码路径，保证两边结果一致。
 
 #[doc(hidden)]
 pub fn is_lower_hex(b: u8) -> bool {
@@ -847,6 +927,20 @@ pub fn proof_json(tree_size: u64, leaf_index: u64, root: &[u8; 32], audit_path: 
     }
     out.push_str("]}");
     out
+}
+
+/// Build the one-line JSON object printed by `inspect`: only the integer
+/// tree_size and leaf_index plus the lowercase-hex root the proof itself
+/// claims. The audit path is intentionally absent — inspect performs no
+/// membership check and must never emit "verified" or similar wording.
+#[doc(hidden)]
+pub fn claims_json(claims: &ProofClaims) -> String {
+    format!(
+        "{{\"tree_size\":{},\"leaf_index\":{},\"root\":\"{}\"}}",
+        claims.tree_size,
+        claims.leaf_index,
+        hex(&claims.root),
+    )
 }
 
 // --- SHA-256 (FIPS 180-4) ---
@@ -1904,6 +1998,138 @@ mod tests {
         assert!(matches!(
             verify_membership(record, &off, size, &root),
             Err(VerifyError::VerificationFailed(_))
+        ));
+    }
+
+    // --- inspect_proof --------------------------------------------------------
+
+    #[test]
+    fn inspect_reads_claims_without_checking_the_audit_path() {
+        // A well-formed proof whose audit path could never establish the
+        // claimed position (too short) is still inspectable: inspect has no
+        // target record and performs no membership check.
+        let records: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let root = mth(&records);
+        let (_, full_path) = root_and_path(&records, 1);
+        let bogus = proof_json(3, 1, &root, &full_path[..full_path.len() - 1]).into_bytes();
+        let claims = inspect_proof(&bogus).expect("format-valid proof is inspectable");
+        assert_eq!(claims.tree_size(), 3);
+        assert_eq!(claims.leaf_index(), 1);
+        assert_eq!(claims.root(), &root);
+
+        // Even an empty path for a multi-record tree and an arbitrary root are
+        // displayed: the claims come straight from the proof.
+        let arbitrary = [0xa5u8; 32];
+        let proof = proof_json(7, 6, &arbitrary, &[]).into_bytes();
+        let claims = inspect_proof(&proof).expect("empty path is still well formed");
+        assert_eq!(claims.tree_size(), 7);
+        assert_eq!(claims.leaf_index(), 6);
+        assert_eq!(claims.root(), &arbitrary);
+    }
+
+    #[test]
+    fn inspect_success_json_has_exactly_three_fields() {
+        let root = [0xabu8; 32];
+        let proof = proof_json(1, 0, &root, &[]).into_bytes();
+        let claims = inspect_proof(&proof).unwrap();
+        assert_eq!(
+            claims_json(&claims),
+            format!(
+                "{{\"tree_size\":1,\"leaf_index\":0,\"root\":\"{}\"}}",
+                hex(&root)
+            )
+        );
+        // The line must never mention verification or the audit path.
+        let line = claims_json(&claims);
+        assert!(!line.contains("verified"));
+        assert!(!line.contains("audit_path"));
+    }
+
+    #[test]
+    fn inspect_accepts_reordered_whitespace_and_unicode_escapes() {
+        let root_hex = "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d";
+        // Field reordering, legal whitespace and equivalent \uXXXX escapes in
+        // field names and hash characters display exactly the same claims.
+        let pretty = format!(
+            " {{\n  \"audit_path\" : [] ,\n  \"root\" : \"{}\",\n  \"leaf_index\" : 0 ,\n  \"tree_size\" : 1\n}}\t",
+            root_hex.replace('e', "\\u0065").replace('a', "\\u0061")
+        );
+        let with_escaped_key = br#"{"tree_size":1,"leaf_index":0,"root":"6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d","audit_path":[]}"#;
+        for bytes in [pretty.into_bytes(), with_escaped_key.to_vec()] {
+            let claims = inspect_proof(&bytes).expect("escaped/reordered proof parses");
+            assert_eq!(claims.tree_size(), 1);
+            assert_eq!(claims.leaf_index(), 0);
+            assert_eq!(hex(claims.root()), root_hex);
+        }
+    }
+
+    #[test]
+    fn inspect_enforces_the_full_proof_format_including_audit_path() {
+        let h = "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d";
+        let z = "0".repeat(64);
+        // Every one of these already contains the three displayed fields;
+        // inspect must still reject them for the reason verify would.
+        let malformed: Vec<Vec<u8>> = vec![
+            // audit_path missing entirely
+            br#"{"tree_size":1,"leaf_index":0,"root":"6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"}"#.to_vec(),
+            // hash of the wrong length inside the non-displayed audit_path
+            format!(r#"{{"tree_size":2,"leaf_index":0,"root":"{z}","audit_path":["00"]}}"#)
+                .into_bytes(),
+            // array never closed
+            format!(r#"{{"tree_size":2,"leaf_index":0,"root":"{z}","audit_path":["{z}""#)
+                .into_bytes(),
+            // duplicate field
+            format!(r#"{{"tree_size":1,"tree_size":1,"leaf_index":0,"root":"{h}","audit_path":[]}}"#)
+                .into_bytes(),
+            b"".to_vec(),
+            b"{}".to_vec(),
+            b"null".to_vec(),
+            b"[]".to_vec(),
+            // trailing data after the object
+            format!(r#"{{"tree_size":1,"leaf_index":0,"root":"{h}","audit_path":[]}}garbage"#)
+                .into_bytes(),
+        ];
+        for bad in &malformed {
+            assert!(
+                matches!(inspect_proof(bad), Err(InspectError::MalformedProof(_))),
+                "{bad:?} must be malformed for inspect"
+            );
+        }
+        // tree_size zero and an out-of-range index are rejected even though
+        // the bytes otherwise form a complete JSON object.
+        let zero = format!(
+            r#"{{"tree_size":0,"leaf_index":0,"root":"{h}","audit_path":[]}}"#
+        );
+        let oob = format!(
+            r#"{{"tree_size":1,"leaf_index":1,"root":"{h}","audit_path":[]}}"#
+        );
+        for bad in [zero.as_bytes(), oob.as_bytes()] {
+            assert!(matches!(
+                inspect_proof(bad),
+                Err(InspectError::MalformedProof(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn inspect_keeps_full_64bit_meaning() {
+        // No materializable tree is needed: only the claimed integers and root
+        // are read, so u64::MAX with the largest valid index inspects fine even
+        // with an empty audit path.
+        let root = [0x01u8; 32];
+        let proof = proof_json(u64::MAX, u64::MAX - 1, &root, &[]).into_bytes();
+        let claims = inspect_proof(&proof).expect("u64::MAX claims are in range");
+        assert_eq!(claims.tree_size(), u64::MAX);
+        assert_eq!(claims.leaf_index(), u64::MAX - 1);
+        assert_eq!(claims.root(), &root);
+        // An integer token above u64::MAX stays a format error.
+        let overflowed = format!(
+            r#"{{"tree_size":18446744073709551616,"leaf_index":0,"root":"{}","audit_path":[]}}"#,
+            hex(&root)
+        );
+        assert!(matches!(
+            inspect_proof(overflowed.as_bytes()),
+            Err(InspectError::MalformedProof(_))
         ));
     }
 }

@@ -5,7 +5,10 @@ use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 
-use roottrace::{hex, hex_nibble, is_lower_hex, proof_json, root_and_path, split_records, RootStream};
+use roottrace::{
+    claims_json, hex, hex_nibble, inspect_proof, is_lower_hex, proof_json, root_and_path,
+    split_records, RootStream,
+};
 
 const VERSION: &str = "0.1.0";
 
@@ -13,6 +16,7 @@ const USAGE: &str = "\
 Usage:
     roottrace root <file>
     roottrace prove <file> <record-index>
+    roottrace inspect <proof-file>
     roottrace verify <record-file> <proof-file> <trusted-tree-size> <trusted-root>
     roottrace --version
 
@@ -33,6 +37,19 @@ Commands:
 
         Example:
             roottrace prove batch.txt 0
+
+    inspect <proof-file>
+        Read one inclusion proof and display the batch size, record position
+        and root the proof itself claims, without needing the target record
+        or any independently trusted values. Output is one JSON object with
+        only the fields tree_size, leaf_index and root. This does NOT verify
+        membership: the displayed values come from the proof itself, are not
+        checked against anything, and must not be reused as the trusted
+        tree size/root arguments of `verify`. A well-formed proof whose
+        audit_path cannot establish the claimed position is still displayed.
+
+        Example:
+            roottrace inspect proof.json
 
     verify <record-file> <proof-file> <trusted-tree-size> <trusted-root>
         Verify an inclusion proof produced by `prove` without needing the
@@ -108,6 +125,25 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        [cmd, proof_path] if cmd == OsStr::new("inspect") => {
+            match inspect_file(Path::new(proof_path)) {
+                Ok(line) => {
+                    println!("{line}");
+                    ExitCode::SUCCESS
+                }
+                Err(InspectError::Read { path, source }) => {
+                    eprintln!(
+                        "roottrace: cannot read '{}': {source}",
+                        display_path(&path)
+                    );
+                    ExitCode::FAILURE
+                }
+                Err(InspectError::MalformedProof(reason)) => {
+                    eprintln!("roottrace: invalid proof: {reason}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         [cmd, path, proof_path, size_arg, root_arg] if cmd == OsStr::new("verify") => {
             match (parse_trusted_size(size_arg), parse_trusted_root(root_arg)) {
                 (Some(trusted_size), Some(trusted_root)) => {
@@ -161,6 +197,16 @@ fn main() -> ExitCode {
 enum ProveError {
     Read(String),
     Missing(u64, u64),
+}
+
+/// Failures reported by `inspect`, kept separate so an unreadable proof file
+/// and a well-readable but malformed proof both exit 1 while saying different
+/// things on stderr.
+enum InspectError {
+    /// The proof path cannot be read (missing, a directory, ...).
+    Read { path: std::path::PathBuf, source: std::io::Error },
+    /// The proof bytes are not a well-formed proof object.
+    MalformedProof(String),
 }
 
 /// Failures reported by `verify`, kept separate so that malformed proofs and
@@ -293,6 +339,26 @@ fn proof_for_file(path: &Path, index: u64) -> Result<String, ProveError> {
     let idx = index as usize;
     let (root, audit_path) = root_and_path(&records, idx);
     Ok(proof_json(size, index, &root, &audit_path))
+}
+
+/// Read a proof file and return the one-line JSON object `inspect` prints:
+/// only tree_size, leaf_index and root, taken straight from the proof. The
+/// proof is parsed with the SAME full format check `verify` uses — a damaged
+/// audit_path, a duplicate field, a zero tree size or an out-of-range index
+/// are all rejected — but no target record and no trusted values exist here,
+/// so no membership check is run and the returned text never says "verified".
+fn inspect_file(path: &Path) -> Result<String, InspectError> {
+    let proof_bytes = fs::read(path).map_err(|source| InspectError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let claims = match inspect_proof(&proof_bytes) {
+        Ok(claims) => claims,
+        Err(roottrace::InspectError::MalformedProof(reason)) => {
+            return Err(InspectError::MalformedProof(reason));
+        }
+    };
+    Ok(claims_json(&claims))
 }
 
 /// Parse a record index: one or more ASCII decimal digits, non-negative, no

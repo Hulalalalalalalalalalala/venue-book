@@ -340,6 +340,52 @@ fn verify_non_utf8_read_failures_exit_1_without_panicking() {
     assert!(!out.stderr.is_empty());
 }
 
+/// `inspect` works with a 0xff-named proof file and keeps the same read /
+/// format / usage exit-code split as the other commands.
+#[test]
+fn inspect_accepts_non_utf8_proof_path() {
+    let dir = TempDir::create();
+    let batch = dir.write(b"batch-\xff.txt", CONTENT);
+    let root_out = run(&[b"root", batch.as_os_str().as_bytes()], None);
+    assert_eq!(root_out.status.code(), Some(0), "{:?}", root_out.stderr);
+    let proof_out = run(&[b"prove", batch.as_os_str().as_bytes(), b"1"], None);
+    assert_eq!(proof_out.status.code(), Some(0), "{:?}", proof_out.stderr);
+    let proof = dir.write(b"proof-\xff.json", &proof_out.stdout);
+
+    let ok = run(&[b"inspect", proof.as_os_str().as_bytes()], None);
+    assert_eq!(ok.status.code(), Some(0), "{:?}", ok.stderr);
+    assert!(ok.stderr.is_empty());
+    // The displayed line carries the proof's own size and root, ends with LF,
+    // and contains no audit_path or verification wording.
+    let line = String::from_utf8(ok.stdout).unwrap();
+    assert!(line.starts_with(r#"{"tree_size":3,"leaf_index":1,"root":""#));
+    assert!(line.ends_with("\"}\n"));
+    assert!(!line.contains("audit_path"));
+    assert!(!line.to_lowercase().contains("verified"));
+
+    // A malformed proof under a 0xff name: format error, exit 1, not usage.
+    let bad = dir.write(b"bad-\xff.json", b"{}");
+    let bad_out = run(&[b"inspect", bad.as_os_str().as_bytes()], None);
+    assert_eq!(bad_out.status.code(), Some(1));
+    assert!(bad_out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&bad_out.stderr);
+    assert!(err.contains("invalid proof") && !err.contains("Usage"));
+
+    // Missing and directory paths carrying 0xff are read failures.
+    let missing = dir.child(b"no-proof-\xff.json");
+    let miss_out = run(&[b"inspect", missing.as_os_str().as_bytes()], None);
+    assert_eq!(miss_out.status.code(), Some(1));
+    assert!(miss_out.stdout.is_empty());
+    assert!(!miss_out.stderr.is_empty());
+
+    let sub = dir.child(b"dir-\xff");
+    fs::create_dir(&sub).unwrap();
+    let dir_out = run(&[b"inspect", sub.as_os_str().as_bytes()], None);
+    assert_eq!(dir_out.status.code(), Some(1));
+    assert!(dir_out.stdout.is_empty());
+    assert!(!dir_out.stderr.is_empty());
+}
+
 /// Non-UTF-8 bytes in the command name or in the trusted size/root arguments
 /// are syntax errors: exit 2 with the usage text and nothing on stdout.
 #[test]
