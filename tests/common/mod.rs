@@ -129,3 +129,84 @@ pub fn assert_root(desc: &str, records: &[&[u8]], file_bytes: &[u8], expected: &
         );
     }
 }
+
+/// Run `roottrace root <file>` on a batch that is built in memory from
+/// construction parameters (the chunked-read batches are too large to spell
+/// out as record literals). Enforces the same strict success contract as
+/// [`assert_root`] - exit 0, empty stderr, exactly one line of 64 lowercase
+/// hex digits terminated by LF, equal to `expected` - but reports the batch
+/// by name, length and LF-offset layout instead of dumping all its bytes.
+pub fn root_of_file_bytes(desc: &str, file_bytes: &[u8], expected: &str) {
+    let tmp = TempFile::create(file_bytes);
+    let output = Command::new(bin())
+        .arg("root")
+        .arg(&tmp.path)
+        .output()
+        .expect("failed to execute roottrace binary");
+
+    if output.status.code() != Some(0) {
+        panic!(
+            "[{desc}] command failed on a {}-byte batch\n\
+             expected root: {expected}\n\
+             exit status: {:?}\n\
+             stderr: {}\n\
+             stdout: {}",
+            file_bytes.len(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
+    }
+    assert!(
+        output.stderr.is_empty(),
+        "[{desc}] successful run wrote to stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout.len(),
+        65,
+        "[{desc}] stdout must be 64 hex digits plus LF, got {} bytes",
+        output.stdout.len()
+    );
+    assert_eq!(output.stdout[64], b'\n', "[{desc}] stdout must end with one LF");
+    let hex = std::str::from_utf8(&output.stdout[..64]).expect("root hex is ASCII");
+    assert!(
+        hex.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "[{desc}] root must be 64 lowercase hex digits, got: {hex}"
+    );
+    assert_eq!(
+        hex, expected,
+        "[{desc}] ROOT MISMATCH for a {}-byte batch\n\
+         expected: {expected}\n\
+         actual:   {hex}",
+        file_bytes.len()
+    );
+}
+
+/// Run `roottrace root <file>` and return the raw process output, for tests
+/// that compare two runs byte for byte or inspect exact stdout/stderr.
+pub fn run_root(file_bytes: &[u8]) -> std::process::Output {
+    let tmp = TempFile::create(file_bytes);
+    Command::new(bin())
+        .arg("root")
+        .arg(&tmp.path)
+        .output()
+        .expect("failed to execute roottrace binary")
+}
+
+/// Join records with LF separators, like [`join_lf`], but owning the result so
+/// it can combine with long records generated at runtime. A trailing LF is
+/// appended only when `trailing_lf` is set.
+pub fn join_lf_owned<S: AsRef<[u8]>>(records: &[S], trailing_lf: bool) -> Vec<u8> {
+    let mut data: Vec<u8> = Vec::new();
+    for (i, rec) in records.iter().enumerate() {
+        if i > 0 {
+            data.push(b'\n');
+        }
+        data.extend_from_slice(rec.as_ref());
+    }
+    if trailing_lf && !records.is_empty() {
+        data.push(b'\n');
+    }
+    data
+}

@@ -408,6 +408,159 @@ MIXED_M = list(MIXED)
 MIXED_M[8] = L65_M
 
 
+# ---------------------------------------------------------------------------
+# Chunked-read batches.
+#
+# # `roottrace root` reads the batch file through a FIXED 64 KiB buffer
+# (CLI_READ, mirroring src/main.rs), so a batch larger than one read length
+# forces several read() calls. CHUNK below is a non-power-of-two (7-record)
+# batch whose middle record is 200_000 bytes: it alone spans the 64 KiB,
+# 128 KiB and 192 KiB read boundaries. Records sit before and after it, the
+# batch contains an empty record and duplicated content, and the long record
+# carries byte-distinctive markers in its first half, second half and tail,
+# with NUL/CR/non-UTF-8 bytes throughout and no LF anywhere. CHUNK_M changes
+# exactly one non-LF byte in the long record's SECOND half.
+#
+# LF_BOUNDARY places runs of four consecutive LFs with separators landing at
+# file offsets k*CLI_READ-2 .. k*CLI_READ+1 (k = 1,2,3), i.e. straddling a
+# read boundary on both sides: three empty records per run must each occupy
+# exactly one position, neither lost nor doubled.
+#
+# The long record is built from explicit construction parameters (not a
+# 200 KiB literal); the Rust regression mirrors them byte for byte, and both
+# the one-record root ROOT_CHUNK_LONG and the batch root pin every byte
+# independently of roottrace.
+# ---------------------------------------------------------------------------
+
+CLI_READ = 64 * 1024  # mirrors the read buffer in src/main.rs
+
+CHUNK_LONG_LEN = 200_000  # > 2 * CLI_READ and > 128 KiB
+CHUNK_LONG_HEAD = b"S200:\x00\xff\xfe\r"
+CHUNK_FILL_ALPHABET = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+# (offset, marker): distinctive bytes in the FIRST half, the SECOND half and
+# the tail of the long record. Each marker keeps NUL, CR and a non-UTF-8 byte.
+CHUNK_MARK_FIRST = (10_000, b"@FIRST-HALF@\x00\r\xff")
+CHUNK_MARK_SECOND = (120_000, b"@SECOND-HALF@\x00\r\xfe")
+CHUNK_TAIL_MARK = b"@TAIL-REGION@\x00\r\xfd"
+# Exactly one changed byte: the 'S' of the second-half marker becomes 'X'.
+CHUNK_MUT_OFFSET = 120_001
+assert CHUNK_MARK_SECOND[1][CHUNK_MUT_OFFSET - CHUNK_MARK_SECOND[0]] == ord("S")
+
+
+def make_chunk_long_record():
+    # Deterministic, explicit construction (no randomness): fixed head with
+    # NUL/CR/non-UTF-8 bytes, cyclic ASCII fill, then fixed markers overwrite
+    # fill bytes at fixed offsets. No byte is ever LF.
+    rec = bytearray(CHUNK_LONG_HEAD)
+    i = 0
+    while len(rec) < CHUNK_LONG_LEN:
+        b = CHUNK_FILL_ALPHABET[i % len(CHUNK_FILL_ALPHABET)]
+        rec.append(b)
+        i += 1
+    for off, marker in (CHUNK_MARK_FIRST, CHUNK_MARK_SECOND):
+        rec[off:off + len(marker)] = marker
+    rec[CHUNK_LONG_LEN - len(CHUNK_TAIL_MARK):] = CHUNK_TAIL_MARK
+    assert len(rec) == CHUNK_LONG_LEN
+    assert b"\n" not in rec
+    assert 0x00 in rec and 0x0D in rec and any(x >= 0x80 for x in rec)
+    return bytes(rec)
+
+
+LONG_CHUNK = make_chunk_long_record()
+LONG_CHUNK_M = (
+    LONG_CHUNK[:CHUNK_MUT_OFFSET]
+    + b"X"
+    + LONG_CHUNK[CHUNK_MUT_OFFSET + 1:]
+)
+assert len(LONG_CHUNK_M) == len(LONG_CHUNK)
+assert LONG_CHUNK_M != LONG_CHUNK
+assert LONG_CHUNK_M[:CHUNK_MUT_OFFSET] == LONG_CHUNK[:CHUNK_MUT_OFFSET]
+assert LONG_CHUNK_M[CHUNK_MUT_OFFSET + 1:] == LONG_CHUNK[CHUNK_MUT_OFFSET + 1:]
+assert LONG_CHUNK_M[CHUNK_MUT_OFFSET] == ord("X")
+
+# 7 records (non-power-of-two): short records on both sides of the long one,
+# an empty record (position 2), duplicated content (positions 3 and 5), a
+# short record with a NUL byte, and a final short record that must still take
+# part in the root.
+CHUNK = [
+    b"before-a",          # 0 short, before the long record
+    LONG_CHUNK,           # 1 200_000-byte record spanning 3+ reads
+    b"",                  # 2 empty record
+    b"dup",               # 3 first occurrence
+    b"after-b\x01",       # 4 short, after the long record
+    b"dup",               # 5 same bytes as position 3, separate position
+    b"tail-final",        # 6 trailing short record
+]
+CHUNK_M = [r if i != 1 else LONG_CHUNK_M for i, r in enumerate(CHUNK)]
+assert len(CHUNK) == len(CHUNK_M) == 7
+assert CHUNK_M[1] is not LONG_CHUNK
+assert CHUNK_M[:1] == CHUNK[:1] and CHUNK_M[2:] == CHUNK[2:]
+
+# Fixed variants proving record POSITIONS and MULTIPLICITY survive the read
+# boundaries: same long record, but the empty record (position 2), the second
+# copy of the duplicated content (position 5) or the trailing short record
+# (position 6) removed. Each is a different record sequence with its own root.
+CHUNK_NO_EMPTY = [r for i, r in enumerate(CHUNK) if i != 2]
+CHUNK_NO_DUP = [r for i, r in enumerate(CHUNK) if i != 5]
+CHUNK_NO_TAIL = CHUNK[:6]
+assert [len(v) for v in (CHUNK_NO_EMPTY, CHUNK_NO_DUP, CHUNK_NO_TAIL)] == [6, 6, 6]
+# CHUNK_NO_EMPTY / CHUNK_NO_DUP differ from one another too: empty position vs
+# duplicate multiplicity are distinct structural changes.
+assert CHUNK_NO_EMPTY != CHUNK_NO_DUP
+
+# Geometry checks against the actual file bytes: the long record crosses all
+# three read boundaries; the trailing LF is the only difference between the
+# two file forms.
+CHUNK_FILE = join_lf(CHUNK, trailing=False)
+CHUNK_FILE_TRAILING = join_lf(CHUNK, trailing=True)
+_long_lo = len(b"before-a\n")
+_long_hi = _long_lo + CHUNK_LONG_LEN
+assert _long_lo == 9 and _long_hi == 200_009
+for k in (1, 2, 3):
+    assert _long_lo < k * CLI_READ < _long_hi, f"long record must cross {k}*64KiB"
+assert CHUNK_FILE_TRAILING == CHUNK_FILE + b"\n"
+assert CHUNK_FILE_TRAILING.count(b"\n") == 7
+# Two consecutive LFs end the long record and the empty record after it.
+assert CHUNK_FILE_TRAILING[_long_hi:_long_hi + 2] == b"\n\n"
+
+
+def make_lf_boundary_batch():
+    # Padding records chosen so four consecutive LFs land on file offsets
+    # k*CLI_READ-2 .. k*CLI_READ+1 for k = 1,2,3: the separator of the padding
+    # record plus three empty-record separators, straddling the boundary on
+    # both sides (two LFs just before, one exactly on it, one just after).
+    records = []
+    pos = 0  # byte offset at which the next record starts
+    lf_offsets = []
+    for k in (1, 2, 3):
+        first_lf = k * CLI_READ - 2
+        pad_len = first_lf - pos
+        prefix = f"CLUSTER{k}-PADDING:".encode() + b"\x00\r\xff"
+        pad = prefix + b"p" * (pad_len - len(prefix))
+        assert len(pad) == pad_len and b"\n" not in pad
+        records.append(pad)
+        # The padding record's LF plus three empty records' LFs.
+        lf_offsets += [first_lf, first_lf + 1, first_lf + 2, first_lf + 3]
+        records += [b"", b"", b""]
+        pos = first_lf + 4
+    records.append(b"end")
+    data = join_lf(records, trailing=True)
+    actual = [i for i, x in enumerate(data) if x == 0x0A]
+    for want in lf_offsets:
+        assert want in actual, f"missing separator at {want}"
+        assert data[want] == 0x0A
+    # Exactly the intended offsets around each boundary.
+    for k in (1, 2, 3):
+        assert [o for o in actual if k * CLI_READ - 2 <= o <= k * CLI_READ + 1] == [
+            k * CLI_READ - 2, k * CLI_READ - 1, k * CLI_READ, k * CLI_READ + 1
+        ]
+    assert len(records) == 13
+    return records
+
+
+LF_BOUNDARY = make_lf_boundary_batch()
+
+
 BATCHES = [
     ("B7", join_lf(BASE7), "seven shared records", True),
     ("B8", join_lf(BASE8), "seven shared records + eighth (epsilon)", True),
@@ -433,6 +586,27 @@ BATCHES += [
      "fixed batch of 10 long and short records (long records in both k=8 subtrees)", True),
     ("MIXED_M", join_lf(MIXED_M),
      "MIXED with only the final byte of the L65 record changed", True),
+]
+
+# Chunked-read batches (files larger than the CLI's 64 KiB read length; the
+# long record itself is generated from fixed parameters, so no 200 KiB literal
+# needs to be copied around). Both trailing-LF file forms share one root.
+BATCHES += [
+    ("CHUNK", CHUNK_FILE,
+     "7-record batch whose 200_000-byte middle record spans three 64 KiB reads; "
+     "empty record, duplicated content and a trailing short record included", False),
+    ("CHUNK_TRAIL", CHUNK_FILE_TRAILING,
+     "CHUNK with a terminating LF: byte-identical record sequence", True),
+    ("CHUNK_M", join_lf(CHUNK_M),
+     "CHUNK with exactly one non-LF byte changed in the long record's second half", False),
+    ("CHUNK_NO_EMPTY", join_lf(CHUNK_NO_EMPTY, trailing=False),
+     "CHUNK with the empty record at position 2 removed (6 records)", False),
+    ("CHUNK_NO_DUP", join_lf(CHUNK_NO_DUP, trailing=False),
+     "CHUNK with the second duplicate of b\"dup\" (position 5) removed (6 records)", False),
+    ("CHUNK_NO_TAIL", join_lf(CHUNK_NO_TAIL, trailing=False),
+     "CHUNK with the trailing short record at position 6 removed (6 records)", False),
+    ("LF_BOUNDARY", join_lf(LF_BOUNDARY),
+     "13 records: four consecutive LFs straddle each of three 64 KiB read boundaries", True),
 ]
 
 
@@ -484,7 +658,9 @@ def main():
              (V_DUP, "V_DUP"), (V_SWAP, "V_SWAP"),
              (V_DROP_EMPTY, "V_DROP_EMPTY"),
              (V_DUP_INSERT, "V_DUP_INSERT"),
-             (MIXED, "MIXED"), (MIXED_M, "MIXED_M")]
+             (MIXED, "MIXED"), (MIXED_M, "MIXED_M"),
+             (CHUNK, "CHUNK"), (CHUNK_M, "CHUNK_M"),
+             (LF_BOUNDARY, "LF_BOUNDARY")]
     equiv += [([rec], name) for name, rec in SINGLE_LONG]
     for recs, tag in equiv:
         a, _ = root_of_file_bytes(join_lf(recs, trailing=True))
@@ -517,6 +693,35 @@ def main():
     for name, _ in SINGLE_LONG:
         assert roots["MIXED"] != roots[name]
         assert roots["MIXED_M"] != roots[name]
+
+    # Chunked-read sanity: the two trailing-LF file forms are byte-identical
+    # apart from the final LF and share a root; the one-byte second-half
+    # mutation changes it; the boundary batch has its own root.
+    assert roots["CHUNK"] == roots["CHUNK_TRAIL"]
+    assert CHUNK_FILE_TRAILING[:-1] == CHUNK_FILE
+    assert roots["CHUNK"] != roots["CHUNK_M"]
+    assert roots["CHUNK"] != roots["LF_BOUNDARY"]
+    assert roots["CHUNK_M"] != roots["LF_BOUNDARY"]
+    assert CHUNK_MUT_OFFSET > CHUNK_LONG_LEN // 2, "mutation must be in the second half"
+    chunk_root = bytes.fromhex(roots["CHUNK"])
+    # The long record alone is a different (one-record) tree.
+    assert mth_recursive([LONG_CHUNK]) != chunk_root
+    assert mth_recursive([LONG_CHUNK_M]) != bytes.fromhex(roots["CHUNK_M"])
+    assert mth_recursive([LONG_CHUNK]) != mth_recursive([LONG_CHUNK_M])
+    # Record ORDER and MULTIPLICITY participate across read boundaries:
+    # dropping the empty record, the second duplicate, or the trailing short
+    # record each yields a different independently-fixed root.
+    assert roots["CHUNK_NO_EMPTY"] == mth_recursive(CHUNK_NO_EMPTY).hex()
+    assert roots["CHUNK_NO_DUP"] == mth_recursive(CHUNK_NO_DUP).hex()
+    assert roots["CHUNK_NO_TAIL"] == mth_recursive(CHUNK_NO_TAIL).hex()
+    for tag in ("CHUNK_NO_EMPTY", "CHUNK_NO_DUP", "CHUNK_NO_TAIL"):
+        assert roots[tag] != roots["CHUNK"], tag
+    assert roots["CHUNK_NO_EMPTY"] != roots["CHUNK_NO_DUP"]
+    assert len(CHUNK) == len(CHUNK_M) == 7
+    # The LF_BOUNDARY roots with/without trailing LF also agree.
+    assert mth_recursive(split_records(join_lf(LF_BOUNDARY, trailing=False))) == bytes.fromhex(
+        roots["LF_BOUNDARY"]
+    )
 
     # ------------------------------------------------------------------
     # Inclusion proofs: the two structurally different path producers must
@@ -579,9 +784,19 @@ def main():
     emit_proof("MIXED_M8", "MIXED (long record L65 in the k=8 right subtree)", MIXED, 8)
     emit_proof("ONE_LF_M0", "single LF (one empty record)", [b""], 0)
 
-    # Payload literal used by the Rust tests to materialise the batches.
+    # Payload literal used by the Rust tests to materialise the batches. The
+    # chunked-read batches are skipped: materialising them as 200 KiB literals
+    # would be pointless; the Rust tests rebuild them from the construction
+    # parameters emitted below.
+    SKIP_PAYLOAD = {
+        "CHUNK", "CHUNK_TRAIL", "CHUNK_M",
+        "CHUNK_NO_EMPTY", "CHUNK_NO_DUP", "CHUNK_NO_TAIL",
+        "LF_BOUNDARY",
+    }
     print("# Rust file payloads:")
     for name, data, desc, trailing in BATCHES:
+        if name in SKIP_PAYLOAD:
+            continue
         print(f"# {name} {desc}")
         print(f"const PAYLOAD_{name}: &[u8] = {rust_byte_string(data)};")
     print()
@@ -614,6 +829,51 @@ def main():
     print(f"#   root ROOT_MIXED = {roots['MIXED']}")
     rust_record_list(MIXED_M, "MIXED_M_RECORDS")
     print(f"#   root ROOT_MIXED_M = {roots['MIXED_M']}")
+
+    # Chunked-read construction parameters and independently fixed roots for
+    # tests/chunked_read_regression.rs. The batches are rebuilt from these
+    # parameters rather than pasted as 200 KiB byte literals; every value here
+    # mirrors make_chunk_long_record/make_lf_boundary_batch above.
+    print("# Chunked-read vectors (files larger than one 64 KiB read):")
+    print(f"const ROOT_CHUNK: &str = \"{roots['CHUNK']}\";")
+    print(f"# CHUNK with a terminating LF is the same record sequence:")
+    print(f"const ROOT_CHUNK_TRAIL: &str = \"{roots['CHUNK_TRAIL']}\";")
+    print(f"const ROOT_CHUNK_M: &str = \"{roots['CHUNK_M']}\";")
+    print(f"const ROOT_CHUNK_NO_EMPTY: &str = \"{roots['CHUNK_NO_EMPTY']}\";")
+    print(f"const ROOT_CHUNK_NO_DUP: &str = \"{roots['CHUNK_NO_DUP']}\";")
+    print(f"const ROOT_CHUNK_NO_TAIL: &str = \"{roots['CHUNK_NO_TAIL']}\";")
+    print(f"const ROOT_LF_BOUNDARY: &str = \"{roots['LF_BOUNDARY']}\";")
+    print(f"const CLI_READ_LEN: usize = {CLI_READ};")
+    print(f"const CHUNK_LONG_LEN: usize = {CHUNK_LONG_LEN};")
+    print(f"const CHUNK_LONG_HEAD: &[u8] = {rust_byte_string(CHUNK_LONG_HEAD)};")
+    print(f"const CHUNK_FILL_ALPHABET: &[u8] = {rust_byte_string(CHUNK_FILL_ALPHABET)};")
+    print(f"const CHUNK_MARK_FIRST_OFFSET: usize = {CHUNK_MARK_FIRST[0]};")
+    print(f"const CHUNK_MARK_FIRST: &[u8] = {rust_byte_string(CHUNK_MARK_FIRST[1])};")
+    print(f"const CHUNK_MARK_SECOND_OFFSET: usize = {CHUNK_MARK_SECOND[0]};")
+    print(f"const CHUNK_MARK_SECOND: &[u8] = {rust_byte_string(CHUNK_MARK_SECOND[1])};")
+    print(f"const CHUNK_TAIL_MARK: &[u8] = {rust_byte_string(CHUNK_TAIL_MARK)};")
+    print(f"const CHUNK_MUT_OFFSET: usize = {CHUNK_MUT_OFFSET};")
+    print(f"# CHUNK record count: {len(CHUNK)}; file bytes: "
+          f"{len(CHUNK_FILE)} (no trailing LF) / {len(CHUNK_FILE_TRAILING)} (trailing LF)")
+    print(f"# the long record occupies file offsets {_long_lo}..{_long_hi}")
+    # LF_BOUNDARY padding records: (fixed prefix incl. NUL/CR/non-UTF-8,
+    # total padding length); the remainder up to the total length is filled
+    # with LF_BOUNDARY_FILL bytes.
+    print(f"const LF_BOUNDARY_FILL: u8 = b'p';")
+    print(f"const LF_BOUNDARY_PAD: &[(&[u8], usize)] = &[")
+    pad_lens = [len(LF_BOUNDARY[0]), len(LF_BOUNDARY[4]), len(LF_BOUNDARY[8])]
+    for k, plen in zip((1, 2, 3), pad_lens):
+        prefix = f"CLUSTER{k}-PADDING:".encode() + b"\x00\r\xff"
+        print(f"    ({rust_byte_string(prefix)}, {plen}),")
+    print("];")
+    lf_offsets = []
+    for k in (1, 2, 3):
+        lf_offsets += [k * CLI_READ - 2, k * CLI_READ - 1, k * CLI_READ, k * CLI_READ + 1]
+    print("# exact file offsets of the twelve clustered separators:")
+    print(f"const LF_BOUNDARY_SEPARATORS: &[usize] = &{lf_offsets};")
+    print(f"# LF_BOUNDARY record count: {len(LF_BOUNDARY)}; "
+          f"file bytes: {len(join_lf(LF_BOUNDARY))}")
+    print()
 
     # ------------------------------------------------------------------
     # Big-tree synthetic proofs. First anchor the two big-tree root
