@@ -1,10 +1,13 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::fs::File;
 use std::path::Path;
 use std::process::ExitCode;
 
-use roottrace::{hex, hex_nibble, is_lower_hex, mth, proof_json, root_and_path, split_records};
+use roottrace::{
+    hex, hex_nibble, is_lower_hex, proof_json, root_and_path, root_from_reader, split_records,
+};
 
 const VERSION: &str = "0.1.0";
 
@@ -252,9 +255,16 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Stream the batch root straight from the file: one fixed-size read buffer,
+/// the leaf hash of the record in progress, and O(log n) finalized subtree
+/// hashes — neither the whole file nor any (possibly very long) record nor
+/// every leaf hash is held in memory. A failure while opening or reading
+/// reports the same way it did for a whole-file read, and a read error
+/// mid-batch yields no root at all rather than a root over the partial prefix.
 fn merkle_root_of_file(path: &Path) -> Result<[u8; 32], String> {
-    let data = fs::read(path).map_err(|e| format!("cannot read '{}': {e}", display_path(path)))?;
-    Ok(mth(&split_records(&data)))
+    let mut file =
+        File::open(path).map_err(|e| format!("cannot read '{}': {e}", display_path(path)))?;
+    root_from_reader(&mut file).map_err(|e| format!("cannot read '{}': {e}", display_path(path)))
 }
 
 fn proof_for_file(path: &Path, index: u64) -> Result<String, ProveError> {
@@ -289,6 +299,7 @@ fn parse_index(arg: &OsStr) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roottrace::mth;
     use std::os::unix::ffi::OsStrExt;
 
     #[test]

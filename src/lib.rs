@@ -575,6 +575,11 @@ fn include_record(
 /// Split raw bytes into records on LF (0x0a). The separator is not part of
 /// any record. A trailing LF terminates the last record without adding an
 /// empty one; an empty file yields zero records.
+///
+/// This materializes one slice per record and is kept for callers that
+/// already hold a whole batch in memory (e.g. the in-memory test helpers and
+/// `prove`); the `root` command builds the same tree without it via the
+/// fixed-buffer [`StreamRoot`].
 #[doc(hidden)]
 pub fn split_records(data: &[u8]) -> Vec<&[u8]> {
     if data.is_empty() {
@@ -585,6 +590,184 @@ pub fn split_records(data: &[u8]) -> Vec<&[u8]> {
         records.pop();
     }
     records
+}
+
+// --- Streaming root ----------------------------------------------------------
+//
+// The `root` command must hash batches too large (or made of records too
+// long, or too numerous) to fit in memory. The construction below keeps:
+//
+//   * ONE fixed-size read buffer ([`READ_CAPACITY`] bytes), independently of
+//     the file's total length — the file is never read whole;
+//   * ONE leaf hash in progress, fed record bytes straight from that buffer,
+//     independently of the longest record — a record is never stored;
+//   * a stack of O(log n) finalized subtree hashes, independently of the
+//     record count — leaf hashes are not retained.
+//
+// Nothing here bounds the input: memory does not shrink by refusing large
+// files, long records or many records, only by never holding them.
+//
+// Result equivalence with the in-memory [`build_tree`] comes from the same
+// RFC 6962 fold order: pushing leaf hashes left to right and merging equal
+// levels builds complete subtrees in postfix order, and the final
+// right-to-left fold joins exactly the sibling pairs the recursive
+// definition's "largest power of two below n" split chooses. Uneven batches
+// therefore need no duplicate of the last leaf and no padded empty leaf.
+
+/// Fixed capacity of the single read buffer used while streaming a batch.
+/// Reads may return fewer bytes at any time (including one); the result is
+/// independent of where read boundaries fall because records are recognized by
+/// their LF bytes, not by chunk boundaries.
+#[doc(hidden)]
+pub const READ_CAPACITY: usize = 64 * 1024;
+
+/// Streaming RFC 6962 Merkle Tree Hash builder.
+///
+/// Feed the raw file bytes in arbitrary chunking with [`StreamRoot::extend`]
+/// and finish with [`StreamRoot::finish`]. Bytes are split into records on LF
+/// exactly like [`split_records`]: the LF is a separator and never content, a
+/// trailing LF only terminates the last record, and an empty input is zero
+/// records. All other bytes — spaces, tabs, CR, NUL, non-UTF-8 sequences —
+/// are record content.
+///
+/// The builder stores a leaf hash in progress (a [`Sha256`] state) and a
+/// log-depth stack of finalized subtree hashes; record bytes are fed straight
+/// from the caller's read buffer, so no file-sized, record-sized or
+/// record-count-sized storage is ever held. Its working memory is bounded
+/// independently of the file's total size, of its longest record and of its
+/// record count.
+struct StreamRoot {
+    /// Hash of the record currently being read: SHA-256(0x00 || record...).
+    /// `None` between records; becoming `Some` writes the 0x00 leaf prefix
+    /// exactly once, including for an empty record.
+    leaf: Option<Sha256>,
+    /// Level stack, bottom level first. An entry is the root hash of a
+    /// complete finalized subtree together with its power-of-two leaf count
+    /// (encoded as the level, 0 = a single leaf). Counts stay implicit in the
+    /// level numbers, so nothing per record is retained.
+    stack: Vec<StackNode>,
+    /// Number of records finalized onto the stack so far. Kept only for the
+    /// invariant check in `finish` (stack size equals its popcount); the fold
+    /// geometry itself is encoded entirely by the stack levels.
+    count: u64,
+}
+
+/// One finalized subtree on [`StreamRoot`]'s stack.
+#[derive(Clone, Copy)]
+struct StackNode {
+    level: u32,
+    hash: [u8; 32],
+}
+
+impl StreamRoot {
+    fn new() -> Self {
+        StreamRoot {
+            leaf: None,
+            stack: Vec::new(),
+            count: 0,
+        }
+    }
+
+    /// Absorb one chunk of raw file bytes. Every LF in `chunk` terminates the
+    /// record currently in progress; bytes between LFs are appended to it.
+    /// The chunk may begin, end or be split in the middle of a record — the
+    /// streaming leaf hasher absorbs the bytes regardless, so read boundaries
+    /// never become record boundaries.
+    fn extend(&mut self, chunk: &[u8]) {
+        let mut rest = chunk;
+        while let Some(rel) = rest.iter().position(|&b| b == b'\n') {
+            // Bytes up to the LF complete the current record's content.
+            self.begin_leaf();
+            self.leaf.as_mut().unwrap().update(&rest[..rel]);
+            self.close_leaf();
+            rest = &rest[rel + 1..];
+        }
+        // A trailing run without an LF is more content of the same record; it
+        // stays in the hasher across calls rather than being copied out.
+        if !rest.is_empty() {
+            self.begin_leaf();
+            self.leaf.as_mut().unwrap().update(rest);
+        }
+    }
+
+    /// Lazily begin a record's leaf hash: create the hasher and write the RFC
+    /// 6962 0x00 leaf prefix exactly once, including for an empty record.
+    fn begin_leaf(&mut self) {
+        if self.leaf.is_none() {
+            let mut h = Sha256::new();
+            h.update(&[0x00]);
+            self.leaf = Some(h);
+        }
+    }
+
+    /// Finalize the record in progress onto the stack, then collapse equal
+    /// levels so each level is held at most once (binary carry).
+    fn close_leaf(&mut self) {
+        let hash = self.leaf.take().unwrap().finalize();
+        self.push_node(StackNode { level: 0, hash });
+        self.count += 1;
+    }
+
+    fn push_node(&mut self, mut node: StackNode) {
+        while self.stack.last().is_some_and(|top| top.level == node.level) {
+            let left = self.stack.pop().unwrap();
+            node = StackNode {
+                level: node.level + 1,
+                hash: node_hash(&left.hash, &node.hash),
+            };
+        }
+        self.stack.push(node);
+    }
+
+    /// Produce the batch root. A record still open at end of input (the file
+    /// did not end with LF) is a complete record; an input of zero records is
+    /// the empty-tree root SHA-256("").
+    fn finish(mut self) -> [u8; 32] {
+        if let Some(leaf) = self.leaf.take() {
+            let hash = leaf.finalize();
+            self.push_node(StackNode { level: 0, hash });
+            self.count += 1;
+        }
+        debug_assert_eq!(
+            self.stack.len() as u32,
+            self.count.count_ones(),
+            "one stack entry per set bit of the record count"
+        );
+        // Postfix fold, right to left: merge the smallest rightmost subtree
+        // into the subtree on its left, which is precisely the RFC's uneven
+        // split at every step. With one or zero entries there is nothing to
+        // merge (a single record is its own leaf hash; zero records below).
+        let mut iter = self.stack.into_iter().rev();
+        let mut acc = match iter.next() {
+            Some(node) => node.hash,
+            None => return sha256(&[]),
+        };
+        for left in iter {
+            acc = node_hash(&left.hash, &acc);
+        }
+        acc
+    }
+}
+
+/// RFC 6962 Merkle Tree Hash of the LF-separated records read from `reader`,
+/// computed with a fixed-size read buffer and O(log n) additional working
+/// memory. The produced root is byte-for-byte the one [`mth`] computes over
+/// the same records (same uneven tree, same order, duplicates preserved).
+///
+/// A read error mid-batch is returned to the caller; nothing is treated as a
+/// complete batch until the reader reports end of input.
+#[doc(hidden)]
+pub fn root_from_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<[u8; 32]> {
+    let mut builder = StreamRoot::new();
+    let mut buf = [0u8; READ_CAPACITY];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        builder.extend(&buf[..n]);
+    }
+    Ok(builder.finish())
 }
 
 /// RFC 6962 section 2.1 leaf hash: SHA-256(0x00 || data). The prefix byte and
@@ -890,6 +1073,7 @@ impl Sha256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Read};
 
     fn hex_of(d: &[u8; 32]) -> String {
         hex(d)
@@ -1007,6 +1191,238 @@ mod tests {
         assert_eq!(split_records(b"a\r\nb\r\n"), vec![b"a\r".as_slice(), b"b\r".as_slice()]);
         // Non-UTF-8 bytes are fine.
         assert_eq!(split_records(b"\xff\xfe\n\x00"), vec![b"\xff\xfe".as_slice(), b"\x00".as_slice()]);
+    }
+
+    // --- streaming root -----------------------------------------------------
+
+    /// Feed all of `data` to a fresh [`StreamRoot`] in chunks of exactly
+    /// `chunk` bytes (the final chunk may be shorter) and finish the root.
+    fn stream_in_chunks(data: &[u8], chunk: usize) -> [u8; 32] {
+        let mut builder = StreamRoot::new();
+        for part in data.chunks(chunk.max(1)) {
+            builder.extend(part);
+        }
+        builder.finish()
+    }
+
+    /// Join exact record bytes with LF, optionally adding a trailing LF.
+    fn join_records(records: &[Vec<u8>], trailing_lf: bool) -> Vec<u8> {
+        let mut data = Vec::new();
+        for (i, rec) in records.iter().enumerate() {
+            if i > 0 {
+                data.push(b'\n');
+            }
+            data.extend_from_slice(rec);
+        }
+        if trailing_lf && !records.is_empty() {
+            data.push(b'\n');
+        }
+        data
+    }
+
+    #[test]
+    fn stream_root_matches_mth_for_empty_and_special_byte_files() {
+        // Exactly the record semantics of split_records, streamed.
+        let cases: &[(&[u8], &[&[u8]])] = &[
+            (b"", &[]),
+            (b"\n", &[b""]),
+            (b"\n\n", &[b"", b""]),
+            (b"\n\n\n", &[b"", b"", b""]),
+            (b"a\n\nb", &[b"a", b"", b"b"]),
+            (b"a\nb", &[b"a", b"b"]),
+            (b"a\nb\n", &[b"a", b"b"]),
+            (b"a\r\nb\r\n", &[b"a\r", b"b\r"]),
+            (b" \t\x00\n\xff\xfe\r", &[b" \t\x00", b"\xff\xfe\r"]),
+        ];
+        for (data, records) in cases {
+            let want = mth(records);
+            for chunk in [1usize, 2, 3, 5, 64, 1000] {
+                assert_eq!(
+                    hex_of(&stream_in_chunks(data, chunk)),
+                    hex_of(&want),
+                    "{data:?} chunked by {chunk} must hash as {records:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stream_root_matches_mth_at_every_size_and_is_chunk_independent() {
+        // Sizes on both sides of many power-of-two boundaries so the uneven
+        // geometry is exercised thoroughly.
+        let sizes: Vec<usize> = (1..=18)
+            .chain([31, 32, 33, 63, 64, 65, 100, 127, 128, 129, 257, 500])
+            .collect();
+        for n in sizes {
+            let records: Vec<Vec<u8>> = (0..n)
+                .map(|i| match i % 8 {
+                    0 => Vec::new(),
+                    1 => format!("record-{i:05}").into_bytes(),
+                    2 => format!("{i}-ends-with-cr\r").into_bytes(),
+                    3 => vec![0xff, 0xfe, 0x00, b'b', 0x80 | (i as u8 & 0x7f)],
+                    4 => b"x".to_vec(),
+                    5 => format!("{i}").into_bytes(),
+                    6 => b"\t spaced \t".to_vec(),
+                    // A long record, occasionally longer than one read buffer.
+                    _ => vec![b'q'; (i * 137) % (2 * READ_CAPACITY + 50) + 1],
+                })
+                .collect();
+            for trailing_lf in [false, true] {
+                let data = join_records(&records, trailing_lf);
+                // The bytes encode exactly what split_records yields: a file
+                // cannot distinguish "zero records" from "one empty record
+                // with no terminating LF" (both are zero bytes), so the
+                // streamed root must match the root of the records the bytes
+                // actually delimit, trailing LF included.
+                let encoded: Vec<&[u8]> = split_records(&data);
+                let want = mth(&encoded);
+                // Chunk sizes at and around the fixed read capacity must not
+                // matter, and neither must byte-at-a-time feeding.
+                for chunk in [
+                    1usize, 2, 3, 7, 55, 63, 64, 65, 4096, 65535, 65536, 65537, 200_000,
+                ] {
+                    assert_eq!(
+                        stream_in_chunks(&data, chunk),
+                        want,
+                        "n={n}, trailing_lf={trailing_lf}, chunk={chunk}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stream_root_handles_records_much_longer_than_the_read_buffer() {
+        // One record several read-buffers long, with and without a trailing
+        // LF; every byte must reach the leaf hash across many reads.
+        for len in [READ_CAPACITY - 1, READ_CAPACITY, READ_CAPACITY + 1, 3 * READ_CAPACITY + 17] {
+            let mut record = vec![0u8; len];
+            for (i, b) in record.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+            // Make sure binary content is present and no byte looks like LF:
+            // remap every 0x0a byte away while keeping the content arbitrary.
+            for b in &mut record {
+                if *b == 0x0a {
+                    *b = 0x0b;
+                }
+            }
+            record[0] = 0xff;
+            *record.last_mut().unwrap() = 0x00;
+            let want = leaf_hash(&record);
+            let mut with_lf = record.clone();
+            with_lf.push(b'\n');
+            for chunk in [1usize, 7, 4096, READ_CAPACITY, READ_CAPACITY + 1] {
+                assert_eq!(stream_in_chunks(&record, chunk), want, "len={len}, chunk={chunk}");
+                assert_eq!(stream_in_chunks(&with_lf, chunk), want, "len={len}+LF, chunk={chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn stream_root_stack_depth_is_logarithmic_in_record_count() {
+        // After every finalized record the stack holds exactly popcount(n)
+        // subtree roots and the in-progress leaf hasher is gone: no per-record
+        // state survives.
+        let n = 200_000usize;
+        let mut builder = StreamRoot::new();
+        for i in 1..=n {
+            builder.extend(b".\n");
+            assert_eq!(builder.stack.len() as u32, (i as u64).count_ones(), "after {i} records");
+            assert!(builder.leaf.is_none(), "no leaf hash lingers between records");
+            assert!(builder.stack.len() <= 64, "O(log n), never O(n)");
+        }
+        // Cross-check against the in-memory tree over the same sequence.
+        let refs: Vec<&[u8]> = vec![b"."; n];
+        assert_eq!(builder.finish(), mth(&refs));
+    }
+
+    #[test]
+    fn stream_root_hashes_each_leaf_and_node_exactly_once() {
+        // n records cost n leaf hashes plus n - 1 interior hashes, no matter
+        // how the bytes are chunked: nothing is re-hashed across reads. The
+        // empty tree's root is SHA-256(""), itself one hash computation.
+        for n in [0usize, 1, 2, 3, 4, 5, 8, 9, 16, 33] {
+            let data = join_records(
+                &(0..n).map(|i| format!("record-{i:04}").into_bytes()).collect::<Vec<_>>(),
+                true,
+            );
+            SHA256_CALLS.with(|c| c.set(0));
+            let _ = stream_in_chunks(&data, 3);
+            let calls = SHA256_CALLS.with(|c| c.get());
+            assert_eq!(calls, if n == 0 { 1 } else { 2 * n - 1 }, "n={n}");
+        }
+    }
+
+    /// Reader that hands out at most `max` bytes per `read` call, so the fixed
+    /// 64 KiB buffer can be driven through arbitrary (including
+    /// byte-at-a-time) read boundaries.
+    struct LimitedReader<'a> {
+        data: &'a [u8],
+        max: usize,
+    }
+
+    impl Read for LimitedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let m = self.max.min(self.data.len()).min(buf.len());
+            buf[..m].copy_from_slice(&self.data[..m]);
+            self.data = &self.data[m..];
+            Ok(m)
+        }
+    }
+
+    /// Reader that serves `ok` bytes (repeating "a\n") and then fails.
+    struct FailReader {
+        served: usize,
+        ok: usize,
+    }
+
+    impl Read for FailReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.served >= self.ok {
+                return Err(io::Error::new(io::ErrorKind::Other, "simulated read failure"));
+            }
+            let m = buf.len().min(self.ok - self.served);
+            for b in &mut buf[..m] {
+                *b = if self.served % 2 == 0 { b'a' } else { b'\n' };
+                self.served += 1;
+            }
+            Ok(m)
+        }
+    }
+
+    #[test]
+    fn root_from_reader_matches_mth_whatever_each_read_returns() {
+        let records: Vec<Vec<u8>> = (0..1000u32)
+            .map(|i| {
+                let mut r = format!("line-{i:05}").into_bytes();
+                if i % 3 == 0 {
+                    r.extend_from_slice(b"\r\xff\x00");
+                }
+                r
+            })
+            .collect();
+        let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+        let want = mth(&refs);
+        let data = join_records(&records, true);
+        for max in [1usize, 2, 3, 17, 4096, READ_CAPACITY - 1, READ_CAPACITY, READ_CAPACITY + 1] {
+            let mut reader = LimitedReader { data: &data, max };
+            let got = root_from_reader(&mut reader).expect("reader must not fail");
+            assert_eq!(got, want, "read returns at most {max} bytes");
+        }
+    }
+
+    #[test]
+    fn root_from_reader_empty_input_is_the_empty_tree_root() {
+        let mut reader = LimitedReader { data: b"", max: 16 };
+        assert_eq!(root_from_reader(&mut reader).unwrap(), sha256(&[]));
+    }
+
+    #[test]
+    fn root_from_reader_propagates_a_mid_batch_read_error_and_emits_no_root() {
+        let mut reader = FailReader { served: 0, ok: 7 };
+        let err = root_from_reader(&mut reader).expect_err("a mid-batch read error must surface");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 
     #[test]
