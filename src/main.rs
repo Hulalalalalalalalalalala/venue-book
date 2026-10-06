@@ -14,6 +14,7 @@ Usage:
     roottrace root <file>
     roottrace prove <file> <record-index>
     roottrace verify <record-file> <proof-file> <trusted-tree-size> <trusted-root>
+    roottrace inspect <proof-file>
     roottrace --version
 
 Commands:
@@ -48,6 +49,18 @@ Commands:
 
         Example:
             roottrace verify record.bin proof.json 9 a8a3e76e...723adc3
+
+    inspect <proof-file>
+        Print the batch size, record position and root value a proof CLAIMS,
+        as one JSON object with exactly the fields tree_size, leaf_index and
+        root (integers and 64 lowercase hexadecimal characters). The proof
+        file is judged by the same full proof format as `verify`, but nothing
+        is verified: there is no target record and no trusted value, so the
+        displayed numbers and root come from the proof itself and must not be
+        treated as trusted inputs for `verify`.
+
+        Example:
+            roottrace inspect proof.json
 
 Exit status:
     0  success
@@ -108,6 +121,20 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        [cmd, path] if cmd == OsStr::new("inspect") => match inspect_proof_file(Path::new(path)) {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(InspectError::Read(reason)) => {
+                eprintln!("roottrace: {reason}");
+                ExitCode::FAILURE
+            }
+            Err(InspectError::Malformed(reason)) => {
+                eprintln!("roottrace: invalid proof: {reason}");
+                ExitCode::FAILURE
+            }
+        },
         [cmd, path, proof_path, size_arg, root_arg] if cmd == OsStr::new("verify") => {
             match (parse_trusted_size(size_arg), parse_trusted_root(root_arg)) {
                 (Some(trusted_size), Some(trusted_root)) => {
@@ -161,6 +188,32 @@ fn main() -> ExitCode {
 enum ProveError {
     Read(String),
     Missing(u64, u64),
+}
+
+/// Failures reported by `inspect`: an unreadable file and a malformed proof
+/// both exit 1 but say different things on stderr.
+enum InspectError {
+    Read(String),
+    Malformed(String),
+}
+
+/// Read a proof file and render the three fields it claims as one JSON line.
+/// The proof is parsed by the library's `inspect_proof`, which applies the
+/// SAME full-format judgement as `verify` (a corrupt `audit_path` — a hash of
+/// the wrong length, an unterminated array — is a format error even though
+/// the path is never displayed). What `inspect` never does is membership
+/// verification: there is no target record and no trusted value, so the
+/// printed tree_size/leaf_index/root are the proof's own claims and the
+/// output must never say "verified" or anything like it.
+fn inspect_proof_file(path: &Path) -> Result<String, InspectError> {
+    let bytes = fs::read(path)
+        .map_err(|e| InspectError::Read(format!("cannot read '{}': {e}", display_path(path))))?;
+    let (tree_size, leaf_index, root) =
+        roottrace::inspect_proof(&bytes).map_err(InspectError::Malformed)?;
+    Ok(format!(
+        "{{\"tree_size\":{tree_size},\"leaf_index\":{leaf_index},\"root\":\"{}\"}}",
+        hex(&root)
+    ))
 }
 
 /// Failures reported by `verify`, kept separate so that malformed proofs and

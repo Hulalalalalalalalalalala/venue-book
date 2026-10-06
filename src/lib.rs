@@ -849,6 +849,23 @@ pub fn proof_json(tree_size: u64, leaf_index: u64, root: &[u8; 32], audit_path: 
     out
 }
 
+/// Read the three display fields of a proof WITHOUT any membership check:
+/// the proof bytes are judged by exactly the same full-format rules `verify`
+/// applies (one complete JSON object; all four fields present, unique and of
+/// the right type; canonical 64-bit unsigned integers; 64-char lowercase hex
+/// hashes; positive `tree_size`; in-range `leaf_index`; no trailing bytes —
+/// including every `audit_path` element, even though the path itself is not
+/// returned), and only then are `tree_size`, `leaf_index` and `root` handed
+/// back. A well-formed proof whose audit path could never establish the
+/// claimed position still parses here: this is the backing parser for the
+/// `inspect` command, which has no target record and no trusted values and
+/// therefore verifies nothing.
+#[doc(hidden)]
+pub fn inspect_proof(proof: &[u8]) -> Result<(u64, u64, [u8; 32]), String> {
+    let proof = parse_proof(proof)?;
+    Ok((proof.tree_size, proof.leaf_index, proof.root))
+}
+
 // --- SHA-256 (FIPS 180-4) ---
 
 // Test-only instrumentation: counts hash computations on the current thread
