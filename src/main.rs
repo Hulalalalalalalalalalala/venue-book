@@ -1,10 +1,11 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 
-use roottrace::{hex, hex_nibble, is_lower_hex, mth, proof_json, root_and_path, split_records};
+use roottrace::{hex, hex_nibble, is_lower_hex, proof_json, root_and_path, split_records, RootStream};
 
 const VERSION: &str = "0.1.0";
 
@@ -252,9 +253,33 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Compute the batch root by streaming the file through a fixed-size buffer.
+/// The whole file is never held in memory: each record is hashed as its bytes
+/// arrive (a record of any length is never stored), and the only state kept
+/// across records is `RootStream`'s subtree stack of at most 64 hashes —
+/// O(log n) in the record count, independent of the file's byte size and of
+/// the longest record. The root printed for a batch is exactly the one the
+/// previous whole-file implementation computed (and the one `prove` still
+/// commits to), because `RootStream` folds the same RFC 6962 tree as `mth`.
 fn merkle_root_of_file(path: &Path) -> Result<[u8; 32], String> {
-    let data = fs::read(path).map_err(|e| format!("cannot read '{}': {e}", display_path(path)))?;
-    Ok(mth(&split_records(&data)))
+    let mut file = fs::File::open(path)
+        .map_err(|e| format!("cannot read '{}': {e}", display_path(path)))?;
+    // Fixed read buffer: how many bytes one read returns cannot affect the
+    // result — read boundaries are never record boundaries.
+    let mut buf = [0u8; 64 * 1024];
+    let mut stream = RootStream::new();
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => stream.feed(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A failure partway through (including a directory path, whose
+            // open succeeds but whose read fails) aborts the whole command:
+            // the partial batch read so far is never reported as a root.
+            Err(e) => return Err(format!("cannot read '{}': {e}", display_path(path))),
+        }
+    }
+    Ok(stream.finish())
 }
 
 fn proof_for_file(path: &Path, index: u64) -> Result<String, ProveError> {
@@ -331,9 +356,9 @@ mod tests {
 
     #[test]
     fn trusted_root_accepts_exactly_64_lowercase_hex() {
-        let h = hex(&mth(&[b"a"]));
+        let h = hex(&roottrace::mth(&[b"a"]));
         let parsed = parse_trusted_root(OsStr::new(&h)).expect("valid root");
-        assert_eq!(parsed, mth(&[b"a"]));
+        assert_eq!(parsed, roottrace::mth(&[b"a"]));
         for bad in [
             "",
             &"a".repeat(63),

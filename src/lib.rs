@@ -587,13 +587,19 @@ pub fn split_records(data: &[u8]) -> Vec<&[u8]> {
     records
 }
 
+/// A fresh leaf hasher primed with the RFC 6962 section 2.1 leaf prefix 0x00.
+fn new_leaf_hasher() -> Sha256 {
+    let mut h = Sha256::new();
+    h.update(&[0x00]);
+    h
+}
+
 /// RFC 6962 section 2.1 leaf hash: SHA-256(0x00 || data). The prefix byte and
 /// the record are fed to the hasher as two consecutive slices, so hashing a
 /// record of any length needs no copy of the record and no allocation beyond
 /// the hasher's fixed-size state.
 fn leaf_hash(data: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(&[0x00]);
+    let mut h = new_leaf_hasher();
     h.update(data);
     h.finalize()
 }
@@ -697,6 +703,115 @@ pub fn root_and_path(leaves: &[&[u8]], m: usize) -> ([u8; 32], Vec<[u8; 32]>) {
     let mut path = Vec::new();
     let root = build_tree(leaves, Some(m), &mut path);
     (root, path)
+}
+
+// --- Streaming root computation ---------------------------------------------
+//
+// `roottrace root` must not hold the batch in memory: the file is read through
+// a fixed-size buffer, every record is hashed as it streams past (a record is
+// never stored, however long it is), and the only per-record state kept is
+// the stack of completed subtree hashes below — at most one entry per bit of
+// the record count, so O(log n) hashes independent of the file's byte length
+// and of the longest record.
+
+/// Incremental RFC 6962 Merkle Tree Hash over an LF-separated byte stream.
+///
+/// Bytes are fed through [`RootStream::feed`] in chunks of any size; how many
+/// bytes one read returns is meaningless to the result, and a record that
+/// spans any number of chunks is hashed in full. Records are delimited by LF
+/// exactly as [`split_records`] defines (the separator is not content, a
+/// trailing LF only terminates the last record, an empty input is zero
+/// records), and the tree is folded with the same largest-power-of-two split
+/// as `build_tree`, so [`RootStream::finish`] returns exactly
+/// `mth(&split_records(whole))` for the concatenation `whole` of everything
+/// fed.
+///
+/// Memory use is a small fixed amount plus at most 64 subtree hashes (one per
+/// bit of the record count): nothing grows with the number of bytes fed or
+/// with the length of any single record.
+#[doc(hidden)]
+pub struct RootStream {
+    /// Hasher for the record currently being accumulated, primed with 0x00.
+    leaf: Sha256,
+    /// Whether any content byte of the current record has been seen. A record
+    /// only exists once it has content or is terminated by an LF, so an empty
+    /// input is zero records and a trailing LF adds none.
+    record_has_bytes: bool,
+    /// Completed subtree hashes, bottom to top in strictly decreasing height;
+    /// entry i covers 2^height consecutive leaves. Together the entries are
+    /// the binary decomposition of the record count so far, which is exactly
+    /// the shape the recursive largest-power-of-two split produces.
+    subtrees: Vec<([u8; 32], u32)>,
+}
+
+impl RootStream {
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        RootStream {
+            leaf: new_leaf_hasher(),
+            record_has_bytes: false,
+            subtrees: Vec::new(),
+        }
+    }
+
+    /// Feed the next chunk of input. LF bytes split records and are not
+    /// content; every other byte — space, tab, CR, NUL, non-UTF-8 — is hashed
+    /// into the current record as-is.
+    #[doc(hidden)]
+    pub fn feed(&mut self, mut chunk: &[u8]) {
+        while let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            self.leaf.update(&chunk[..pos]);
+            self.record_has_bytes |= pos > 0;
+            self.finish_record();
+            chunk = &chunk[pos + 1..];
+        }
+        self.leaf.update(chunk);
+        self.record_has_bytes |= !chunk.is_empty();
+    }
+
+    /// Close the current record: finalize its leaf hash and fold it into the
+    /// subtree stack, merging completed subtrees of equal height so the stack
+    /// always holds the largest complete subtrees on the left.
+    fn finish_record(&mut self) {
+        let leaf = std::mem::replace(&mut self.leaf, new_leaf_hasher()).finalize();
+        self.record_has_bytes = false;
+        let mut acc = leaf;
+        let mut height = 0u32;
+        while self.subtrees.last().is_some_and(|&(_, h)| h == height) {
+            let (left, _) = self.subtrees.pop().unwrap();
+            acc = node_hash(&left, &acc);
+            height += 1;
+        }
+        self.subtrees.push((acc, height));
+    }
+
+    /// Produce the batch root. A final record without a terminating LF counts
+    /// in full; a trailing LF adds no record; no input at all is the RFC 6962
+    /// empty-tree hash SHA-256("").
+    #[doc(hidden)]
+    pub fn finish(mut self) -> [u8; 32] {
+        if self.record_has_bytes {
+            self.finish_record();
+        }
+        match self.subtrees.pop() {
+            None => sha256(&[]),
+            Some((mut acc, _)) => {
+                // Fold the remaining complete subtrees right to left: reading
+                // the binary decomposition of the record count this way is
+                // the recursive k-split of build_tree.
+                while let Some((left, _)) = self.subtrees.pop() {
+                    acc = node_hash(&left, &acc);
+                }
+                acc
+            }
+        }
+    }
+}
+
+impl Default for RootStream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[doc(hidden)]
@@ -1032,6 +1147,114 @@ mod tests {
         expect.extend_from_slice(&left);
         expect.extend_from_slice(&right);
         assert_eq!(hex_of(&mth(&[b"a", b"b", b"c"])), hex_of(&sha256(&expect)));
+    }
+
+    // --- streaming root computation ------------------------------------------
+
+    /// Root of a batch computed by streaming it through `chunk`-byte feeds.
+    fn streaming_root(data: &[u8], chunk: usize) -> [u8; 32] {
+        let mut s = RootStream::new();
+        for piece in data.chunks(chunk) {
+            s.feed(piece);
+        }
+        s.finish()
+    }
+
+    #[test]
+    fn streaming_root_matches_whole_file_root_for_every_chunking() {
+        let mut batches: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"\n".to_vec(),
+            b"\n\n\n".to_vec(),
+            b"a".to_vec(),
+            b"a\n".to_vec(),
+            b"\na".to_vec(),
+            b"a\nb".to_vec(),
+            b"a\nb\n".to_vec(),
+            b"a\n\n\nb\n\n".to_vec(),
+            b"\r\n \t\r\n".to_vec(),
+            b"\xff\xfe\x00bin\n\x00\r \xff".to_vec(),
+            b"alpha\nbeta\n\ngamma\nalpha\ndelta\r\n\xff\xfe\x00binary\nepsilon\nzeta\x01tail\n".to_vec(),
+        ];
+        // A record far longer than any read buffer (200 KB, no LF inside,
+        // NUL/CR/non-UTF-8 bytes throughout) between two short records.
+        let mut long = b"head\n".to_vec();
+        long.extend((0..200_000u32).map(|i| {
+            let b = (i.wrapping_mul(2_654_435_761) >> 13) as u8;
+            if b == b'\n' { 0x0b } else { b }
+        }));
+        long.extend_from_slice(b"\ntail\n");
+        batches.push(long);
+        // Many short and empty records, duplicates included.
+        let mut many = Vec::new();
+        for i in 0..5_000u32 {
+            many.extend_from_slice(format!("rec{}\n", i % 7).as_bytes());
+            many.push(b'\n'); // an empty record after each
+        }
+        batches.push(many);
+
+        for data in &batches {
+            let expected = mth(&split_records(data));
+            for chunk in [1usize, 2, 3, 5, 7, 31, 63, 64, 65, 100, 4096, 64 * 1024] {
+                assert_eq!(
+                    hex_of(&streaming_root(data, chunk)),
+                    hex_of(&expected),
+                    "chunk size {chunk} changed the root for a {}-byte batch",
+                    data.len()
+                );
+            }
+            // One single feed of the whole batch must agree as well.
+            assert_eq!(hex_of(&streaming_root(data, data.len().max(1))), hex_of(&expected));
+        }
+    }
+
+    #[test]
+    fn streaming_root_agrees_with_proof_root_for_the_same_batch() {
+        // `prove` commits to the root from root_and_path; the streamed root
+        // of the same batch must be identical at every position.
+        let owned: Vec<Vec<u8>> = (0..100u32).map(|i| format!("record-{i:04}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        let mut file = Vec::new();
+        for r in &refs {
+            file.extend_from_slice(r);
+            file.push(b'\n');
+        }
+        let streamed = streaming_root(&file, 13);
+        assert_eq!(hex_of(&streamed), hex_of(&mth(&refs)));
+        for m in [0usize, 1, 50, 99] {
+            let (proof_root, _) = root_and_path(&refs, m);
+            assert_eq!(hex_of(&streamed), hex_of(&proof_root), "prove/root disagree at m={m}");
+        }
+    }
+
+    #[test]
+    fn streaming_root_keeps_only_a_logarithmic_subtree_stack() {
+        let mut s = RootStream::new();
+        // 102_400 empty records fed as fixed-size chunks of pure LF.
+        let chunk = [b'\n'; 4096];
+        for _ in 0..25 {
+            s.feed(&chunk);
+        }
+        // One stack entry per set bit of the record count: 102_400 < 2^17.
+        assert!(
+            s.subtrees.len() <= 17,
+            "subtree stack must stay logarithmic, got {} entries",
+            s.subtrees.len()
+        );
+        let expected = mth(&vec![b"".as_slice(); 102_400]);
+        assert_eq!(hex_of(&s.finish()), hex_of(&expected));
+    }
+
+    #[test]
+    fn streaming_root_edge_cases_match_fixed_definitions() {
+        // Empty input: SHA-256(""). Single LF: one empty record, SHA-256(0x00).
+        assert_eq!(hex_of(&streaming_root(b"", 1)), hex_of(&sha256(b"")));
+        assert_eq!(hex_of(&streaming_root(b"\n", 1)), hex_of(&leaf_hash(b"")));
+        // A trailing LF adds no record; a missing one still completes it.
+        assert_eq!(streaming_root(b"a\n", 1), streaming_root(b"a", 1));
+        // Consecutive LFs keep the empty record between them.
+        assert_eq!(streaming_root(b"a\n\n", 1), mth(&[b"a", b""]));
+        assert_ne!(streaming_root(b"a\n\n", 1), streaming_root(b"a\n", 1));
     }
 
     #[test]
