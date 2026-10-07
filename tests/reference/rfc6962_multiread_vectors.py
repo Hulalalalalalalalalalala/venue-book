@@ -11,10 +11,19 @@ record-separating LFs land exactly on the last/first byte of a read boundary.
 The roots are computed with the two structurally different, already
 cross-validated reference algorithms from rfc6962_vectors.py (the RFC's
 recursive definition and an order-sensitive stack fold over the standard
-library `hashlib.sha256`); they must agree.  The Rust test
-tests/multi_read_regression.rs rebuilds the exact same bytes with the same
-deterministic construction and pins the printed constants, so the expected
-roots are fixed independently of the implementation being checked.
+library `hashlib.sha256`); they must agree.  Inclusion (audit) paths for the
+long record (position 4) and the trailing short record (position 9) - in both
+the original and the one-byte-modified batch - are likewise produced by the
+two structurally different path builders from rfc6962_vectors.py (the
+recursive PATH transcription and the top-down descent whose sibling hashes
+come from the stack fold), must agree, and are re-hashed back to the batch
+root by the independent recursive inclusion verifier; every other position of
+both batches is checked the same way before the constants are printed.  The
+Rust tests tests/multi_read_regression.rs and
+tests/prove_multi_read_regression.rs rebuild the exact same bytes with the
+same deterministic construction and pin the printed constants, so the
+expected roots and audit paths are fixed independently of the implementation
+being checked.
 
 Batch record sequence (10 records, a non-power-of-two count; RFC 6962 splits
 k=8, so the long record at position 4 sits in the left subtree and the
@@ -44,7 +53,14 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rfc6962_vectors import mth_fold, mth_recursive, split_records
+from rfc6962_vectors import (
+    audit_path_fold,
+    audit_path_recursive,
+    mth_fold,
+    mth_recursive,
+    split_records,
+    verify_inclusion,
+)
 
 READ_BUF = 64 * 1024  # the fixed read buffer `roottrace root` streams through
 
@@ -199,6 +215,57 @@ def main():
     print()
     print(f"const ROOT_MREAD: &str = \"{root}\";")
     print(f"const ROOT_MREAD_M: &str = \"{root_m}\";")
+    print()
+
+    # ------------------------------------------------------------------
+    # Inclusion proofs for the long record (position 4) and the trailing
+    # short record (position 9), in the original and the modified batch.
+    # First cross-check EVERY position of both batches: the two structurally
+    # different path producers must agree and each path must re-hash to the
+    # batch root via the independent recursive inclusion verifier.
+    # ------------------------------------------------------------------
+    for tag, recs, expected in (("MREAD", RECORDS, root), ("MREAD_M", RECORDS_M, root_m)):
+        for m in range(len(recs)):
+            p1 = audit_path_recursive(recs, m)
+            p2 = audit_path_fold(recs, m)
+            assert p1 == p2, f"path producers disagree for {tag} m={m}"
+            assert verify_inclusion(recs[m], m, len(recs), p1) == bytes.fromhex(expected), \
+                f"proof does not verify for {tag} m={m}"
+
+    # The one-byte change sits INSIDE leaf 4, so the long record's own audit
+    # path (sibling subtree hashes only) must be identical in both batches,
+    # while the trailing record's path contains the left-subtree hash covering
+    # the long record and must change.
+    p4 = audit_path_recursive(RECORDS, 4)
+    p4_m = audit_path_recursive(RECORDS_M, 4)
+    p9 = audit_path_recursive(RECORDS, 9)
+    p9_m = audit_path_recursive(RECORDS_M, 9)
+    assert p4 == p4_m, "long record's sibling subtrees are untouched"
+    assert p9 != p9_m, "trailing record's path must bind the changed subtree"
+    assert p9[0] == p9_m[0] and p9[1] != p9_m[1], \
+        "leaf-to-root: the sibling leaf hash stays, the left-subtree hash " \
+        "covering leaf 4 changes"
+    # Position 9 is the lone record of the k=8 right subtree's deeper split:
+    # path = [MTH(records[8:9]), MTH(records[0:8])] (leaf-to-root) - two
+    # elements, no padding.
+    # Position 4 sits at depth 3 of the balanced size-8 left subtree, plus the
+    # right-subtree hash: four elements.
+    assert len(p9) == 2 and len(p4) == 4
+
+    def emit_path(const_tag, seq_tag, recs, m):
+        path = audit_path_recursive(recs, m)
+        print(f"# Audit path for {seq_tag} m={m} (leaf-to-root; two independent")
+        print(f"# producers agree and the path verifies against ROOT_{seq_tag}):")
+        elems = ", ".join(f"\"{h.hex()}\"" for h in path)
+        print(f"const PATH_{const_tag}_M{m}: &[&str] = &[{elems}];")
+        print()
+
+    print("# Fixed inclusion-proof audit paths (RFC 6962 section 2.1.1):")
+    print()
+    emit_path("MREAD", "MREAD", RECORDS, 4)
+    emit_path("MREAD", "MREAD", RECORDS, 9)
+    emit_path("MREAD_MOD", "MREAD_M", RECORDS_M, 4)
+    emit_path("MREAD_MOD", "MREAD_M", RECORDS_M, 9)
 
 
 if __name__ == "__main__":
