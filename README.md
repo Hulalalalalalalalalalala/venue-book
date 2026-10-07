@@ -380,52 +380,131 @@ roottrace 0.1.0
 
 除命令行外，roottrace 同时是一个 Rust 库：其他 Rust 程序可以直接在内存中
 核验成员证明，无需准备完整批次或临时文件。在 `Cargo.toml` 中把本包加入
-`[dependencies]` 后，成员核验的入口是 `roottrace::verify_membership`：
+`[dependencies]` 后，成员核验的入口是 `roottrace::verify_membership`。
+
+下面用一个含重复记录的小批次完整走一遍。批次文件内容为：
+
+```text
+alpha
+beta
+alpha
+gamma
+delta
+```
+
+即 5 条记录，序号从 0 开始：`0` 是 `"alpha"`，`1` 是 `"beta"`，`2` 又是
+`"alpha"`，`3` 是 `"gamma"`，`4` 是 `"delta"`。可信值由**证明之外**的
+批次数据独立确认：对完整批次自行运行 `roottrace root` 得到根值，批次的
+记录数（5）即可信树大小——这两个值不取自证明本身。再为序号 `2`（第二
+个 `"alpha"`）生成证明：
+
+```sh
+$ printf 'alpha\nbeta\nalpha\ngamma\ndelta\n' > batch.txt
+$ roottrace root batch.txt
+90dabc2745c8500b60e44505fceebe7ab2a3b2fcebcb9d208b0e267cb7f700d3
+$ roottrace prove batch.txt 2
+{"tree_size":5,"leaf_index":2,"root":"90dabc2745c8500b60e44505fceebe7ab2a3b2fcebcb9d208b0e267cb7f700d3","audit_path":["4c79d0d62f7cf5ca8874155f2d3b875f2625da2bb3abc86bbd6833f25ba90e51","983cb57c04cddd52634edab38a7bef85708a974f114bbd9aa9ec5d4ce6656b4b","5c7117fb9edb0cec387257891105da6a6616722af247083e2d6eda671529cdc5"]}
+```
+
+下面的程序只依赖 roottrace 库，用上面 `prove` 的原样输出和独立确认的
+可信值，在内存中核验序号 `2` 的记录，无需准备任何输入文件：
 
 ```rust
 use roottrace::{verify_membership, VerifyError};
 
-// 1. 目标记录的全部原始字节（空切片表示一条空记录；末尾 LF/CR/空格、
-//    NUL、非 UTF-8 字节都属于内容，不按批次文件的 LF 规则切分）。
-let record: &[u8] = b"some record bytes";
-// 2. 证明 JSON 的原始字节（例如 `roottrace prove` 的输出；字段重排、
-//    合法空白与等价字符串转义都被接受）。
-let proof: &[u8] = br#"{"tree_size":9,"leaf_index":3,"root":"a8a3...dc3","audit_path":["..."]}"#;
-// 3. 独立确认的可信值：树大小（u64，必须为正）和 32 字节根值。
-let trusted_tree_size: u64 = 9;
-let trusted_root: [u8; 32] = [0xa8, 0xa3, /* ...来自可信渠道的 32 字节... */ 0xc3];
+// 1. 目标记录的全部字节：批次中序号 2 的记录 "alpha"。从批次文件
+//    取出记录时不包含分隔它的 LF，切片就是这条记录的全部内容。
+let record: &[u8] = b"alpha";
+
+// 2. 证明 JSON 的原始字节（`roottrace prove batch.txt 2` 的原样输出；
+//    字段重排、合法空白与等价字符串转义同样被接受）。
+let proof: &[u8] = br#"{"tree_size":5,"leaf_index":2,"root":"90dabc2745c8500b60e44505fceebe7ab2a3b2fcebcb9d208b0e267cb7f700d3","audit_path":["4c79d0d62f7cf5ca8874155f2d3b875f2625da2bb3abc86bbd6833f25ba90e51","983cb57c04cddd52634edab38a7bef85708a974f114bbd9aa9ec5d4ce6656b4b","5c7117fb9edb0cec387257891105da6a6616722af247083e2d6eda671529cdc5"]}"#;
+
+// 3. 独立确认的可信值：树大小 5（u64，必须为正）和 32 字节根值，
+//    即上面 `roottrace root` 对完整批次的输出逐字节展开。
+let trusted_tree_size: u64 = 5;
+let trusted_root: [u8; 32] = [
+    0x90, 0xda, 0xbc, 0x27, 0x45, 0xc8, 0x50, 0x0b,
+    0x60, 0xe4, 0x45, 0x05, 0xfc, 0xee, 0xbe, 0x7a,
+    0xb2, 0xa3, 0xb2, 0xfc, 0xeb, 0xcb, 0x9d, 0x20,
+    0x8b, 0x0e, 0x26, 0x7c, 0xb7, 0xf7, 0x00, 0xd3,
+];
 
 match verify_membership(record, proof, trusted_tree_size, &trusted_root) {
     Ok(membership) => {
         // 核验成功：记录确实位于证明声明的位置。
-        println!("位置 {}", membership.leaf_index());   // 从 0 开始的记录序号
-        println!("树大小 {}", membership.tree_size());  // 即你的可信树大小
-        println!("根值 {:?}", membership.root());       // 即你的可信根值
+        println!("记录序号 {}", membership.leaf_index()); // 从 0 开始的序号
+        println!("树大小   {}", membership.tree_size());  // 即可信树大小
+        println!("根值     {:?}", membership.root());     // 即可信根值
     }
     Err(VerifyError::MalformedProof(reason)) => {
-        // 证明格式无效：不是合法的证明 JSON（字段缺失/重复、整数或哈希
-        // 不合法、对象后有多余字节等）。
+        // 证明不符合完整格式（字段缺失/重复、整数或哈希不合法、
+        // 对象后有多余字节等）。
         eprintln!("证明格式无效: {reason}");
     }
     Err(VerifyError::VerificationFailed(reason)) => {
-        // 证明格式合法，但记录内容、可信树大小、可信根值或审计路径不匹配。
+        // 证明格式合法，但记录内容、可信树大小、可信根值或
+        // 审计路径不匹配。
         eprintln!("核验失败: {reason}");
     }
     Err(VerifyError::InvalidTrustedSize) => {
-        // 调用参数无效：可信树大小为 0。不存在包含记录的零节点树，
-        // 不会被当作"空树中的成员证明"接受。
+        // 调用参数无效：可信树大小为 0。
         eprintln!("可信树大小必须为正整数");
     }
 }
 ```
 
+用本例的数据运行，进入成功分支，实际输出为：
+
+```text
+记录序号 2
+树大小   5
+根值     [144, 218, 188, 39, 69, 200, 80, 11, 96, 228, 69, 5, 252, 238, 190, 122, 178, 163, 178, 252, 235, 203, 157, 32, 139, 14, 38, 124, 183, 247, 0, 211]
+```
+
+`Membership` 的三个访问器：`leaf_index()` 是证明声明的、从 0 开始的
+记录序号（本例为 `2`）；`tree_size()` 和 `root()` 返回的就是你传入并
+已核对一致的可信值（本例为 `5` 和上面那 32 个字节）。
+
+**重复内容只核验声明的位置。** `"alpha"` 同时位于序号 0 和 2，本例的
+证明声明的是序号 2；核验成功只表示该记录位于序号 2，不表示序号 0 的
+同内容记录也已核验。证明绑定的是位置，不会去重，也不会改指第一次出现
+的位置。
+
+**字节边界（重要）：** `record` 切片是一条记录的**全部内容**——库不按
+LF 拆分，也不自动删除末尾换行；末尾的 LF/CR/空格、NUL、非 UTF-8 字节
+都属于记录内容。从批次文件取出记录时，分隔记录的那个 LF 不属于记录，
+所以本例是 `b"alpha"` 而不是 `b"alpha\n"`。如果给目标记录多追加一个
+LF，它就成了另一条记录，沿用原证明与可信值将核验失败（接上面的变量）：
+
+```rust
+let record: &[u8] = b"alpha\n"; // 多了一个 LF，已是另一条记录
+assert!(matches!(
+    verify_membership(record, proof, trusted_tree_size, &trusted_root),
+    Err(VerifyError::VerificationFailed(_))
+));
+```
+
+空切片 `b""` 表示一条**空记录**，可以核验它在对应树中的成员证明；这与
+空树不同——空树没有任何记录，可信树大小为 `0` 时 `verify_membership`
+直接返回 `Err(VerifyError::InvalidTrustedSize)`，不存在"空树中的成员
+证明"。
+
+**按错误类型判断结果**，不要依赖原因字符串的固定文字（`reason` 的措辞
+不保证稳定）：
+
+- `VerifyError::MalformedProof`：证明不符合完整格式。例如把上例的
+  `proof` 换成 `br#"{"tree_size":5,"leaf_index":2}"#`（必需字段缺失）。
+- `VerifyError::VerificationFailed`：证明格式合法，但记录字节、可信
+  树大小、可信根值或审计路径不匹配。例如上面的 `b"alpha\n"`，或把
+  `trusted_tree_size` 改成 `6`。
+- `VerifyError::InvalidTrustedSize`：可信树大小为 `0`，属于调用参数
+  无效，与证明内容无关。
+
 **可信值必须独立确认。** 与 `verify` 命令一样，证明自带的 `tree_size` 和
 `root` 只用于和你提供的可信值比对，绝不作为信任依据；可信值应来自签名
-公告、带外账本，或对完整批次自行运行 `roottrace root` 等渠道。成功结果
-`Membership` 的 `tree_size()` 和 `root()` 返回的就是你传入并已核对一致
-的可信值，`leaf_index()` 是证明声明的（从 0 开始的）位置——相同内容出现
-在其他位置不能替代这个位置。树大小和序号始终保持完整 64 位含义，即使
-超过平台的指针宽度也不会被截断。
+公告、带外账本，或像本例这样对完整批次自行运行 `roottrace root` 等渠道。
+树大小和序号始终保持完整 64 位含义，即使超过平台的指针宽度也不会被截断。
 
 库本身不向标准输出或标准错误打印任何内容；成功与失败的展示方式完全由
 调用方决定。失败时只返回上述错误，不会返回任何表示已核验成功的结果。
@@ -435,8 +514,9 @@ match verify_membership(record, proof, trusted_tree_size, &trusted_root) {
 **只想读取证明的声明而不核验？** 库为此提供
 `roottrace::inspect_proof(&[u8]) -> Result<ProofClaims, InspectError>`：它用
 与 `verify_membership` 完全相同的完整格式判定解读证明，成功则返回证明自身
-声明的 `tree_size()`、`leaf_index()` 与 `root()`。这里没有目标记录和可信
-值，因此**不做成员核验**——审计路径能否证明声明位置完全不检查；返回的大小
-和根值直接来自证明，绝不能当作 `verify_membership` 的可信输入。证明格式
-无效时返回 `InspectError::MalformedProof`。命令行的 `inspect` 子命令就建立
-在这个函数之上。
+声明的 `tree_size()`、`leaf_index()` 与 `root()`。注意：`inspect_proof`
+成功**只表示**读出了证明自身的声明——这里没有目标记录和可信值，审计路径
+能否证明声明位置完全不检查；返回的大小和根值直接来自证明，**不能**当作
+`verify_membership` 核验同一证明的可信输入（那等于让证明自我背书）。证明
+格式无效时返回 `InspectError::MalformedProof`。命令行的 `inspect` 子命令
+就建立在这个函数之上。
