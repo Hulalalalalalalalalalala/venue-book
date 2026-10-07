@@ -652,18 +652,102 @@ fn include_record(
     Ok(root)
 }
 
+// --- Record splitting ---------------------------------------------------------
+//
+// The LF record rule lives in exactly one place: `RecordSplitter` below.
+// `prove` carves the whole batch into records through `split_records`, and
+// `root` consumes the batch incrementally through `RootStream`, but both are
+// thin adapters over the same splitter events, so the two commands can never
+// drift apart on what counts as a record:
+//
+//   * LF (0x0a) separates records and is not part of any record;
+//   * every other byte — space, tab, CR, NUL, non-UTF-8 — is record content,
+//     kept verbatim: no text decoding, trimming or newline normalization;
+//   * a record exists once it is terminated by an LF, even when empty, so
+//     leading and consecutive LFs keep their empty records;
+//   * at the end of input, pending content bytes are the final record, a
+//     trailing LF adds nothing, and empty input is zero records.
+
+/// One record-splitting event emitted by [`RecordSplitter`].
+enum RecordEvent<'a> {
+    /// Content bytes of the record currently being accumulated. Within one
+    /// `feed` call, a record's bytes present in that chunk are delivered as
+    /// exactly one `RecordBytes` event; the event is skipped when the record
+    /// contributes no bytes in this chunk.
+    RecordBytes(&'a [u8]),
+    /// The current record is complete: it was terminated by an LF, or by the
+    /// end of input with content bytes pending. The record exists even when
+    /// no `RecordBytes` ever arrived for it (an empty record).
+    RecordEnd,
+}
+
+/// Streaming form of the record-splitting rules: bytes are fed in chunks of
+/// any size and record events come out, with chunk boundaries never becoming
+/// record boundaries — a record spanning any number of chunks is delivered
+/// piece by piece and ended exactly once, and two LFs falling into adjacent
+/// chunks still yield their empty record. The only state kept between chunks
+/// is whether the current record has any content bytes yet; no record bytes
+/// are ever buffered.
+struct RecordSplitter {
+    /// Whether any content byte of the current record has been seen. A record
+    /// only exists once it has content or is terminated by an LF, so an empty
+    /// input is zero records and a trailing LF adds none.
+    record_has_bytes: bool,
+}
+
+impl RecordSplitter {
+    fn new() -> Self {
+        RecordSplitter { record_has_bytes: false }
+    }
+
+    /// Feed the next chunk of input, reporting record content and record
+    /// boundaries through `sink`. LF bytes split records and are not content;
+    /// every other byte is reported as content as-is.
+    fn feed<'a>(&mut self, mut chunk: &'a [u8], sink: &mut impl FnMut(RecordEvent<'a>)) {
+        while let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            if pos > 0 {
+                sink(RecordEvent::RecordBytes(&chunk[..pos]));
+                self.record_has_bytes = true;
+            }
+            sink(RecordEvent::RecordEnd);
+            self.record_has_bytes = false;
+            chunk = &chunk[pos + 1..];
+        }
+        if !chunk.is_empty() {
+            sink(RecordEvent::RecordBytes(chunk));
+            self.record_has_bytes = true;
+        }
+    }
+
+    /// Signal the end of input: a final record that has content but no
+    /// terminating LF is completed now; a trailing LF adds no record.
+    fn finish(&mut self, end_record: &mut impl FnMut()) {
+        if self.record_has_bytes {
+            end_record();
+            self.record_has_bytes = false;
+        }
+    }
+}
+
 /// Split raw bytes into records on LF (0x0a). The separator is not part of
 /// any record. A trailing LF terminates the last record without adding an
 /// empty one; an empty file yields zero records.
+///
+/// This is the whole-batch view of the shared [`RecordSplitter`] rules: the
+/// records returned here are exactly the records `RootStream` folds when the
+/// same bytes are streamed through it in any chunking.
 #[doc(hidden)]
 pub fn split_records(data: &[u8]) -> Vec<&[u8]> {
-    if data.is_empty() {
-        return Vec::new();
-    }
-    let mut records: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
-    if data.last() == Some(&b'\n') {
-        records.pop();
-    }
+    let mut records: Vec<&[u8]> = Vec::new();
+    // The whole batch is fed in a single call, so each record's content
+    // arrives as one `RecordBytes` event borrowing `data` — no copying.
+    let mut current: &[u8] = &[];
+    let mut splitter = RecordSplitter::new();
+    splitter.feed(data, &mut |event| match event {
+        RecordEvent::RecordBytes(bytes) => current = bytes,
+        RecordEvent::RecordEnd => records.push(std::mem::take(&mut current)),
+    });
+    splitter.finish(&mut || records.push(std::mem::take(&mut current)));
     records
 }
 
@@ -792,31 +876,33 @@ pub fn root_and_path(leaves: &[&[u8]], m: usize) -> ([u8; 32], Vec<[u8; 32]>) {
 // never stored, however long it is), and the only per-record state kept is
 // the stack of completed subtree hashes below — at most one entry per bit of
 // the record count, so O(log n) hashes independent of the file's byte length
-// and of the longest record.
+// and of the longest record. Record boundaries come from the shared
+// `RecordSplitter`, so `root` and `prove` divide a batch into records by
+// exactly the same rules.
 
 /// Incremental RFC 6962 Merkle Tree Hash over an LF-separated byte stream.
 ///
 /// Bytes are fed through [`RootStream::feed`] in chunks of any size; how many
 /// bytes one read returns is meaningless to the result, and a record that
 /// spans any number of chunks is hashed in full. Records are delimited by LF
-/// exactly as [`split_records`] defines (the separator is not content, a
-/// trailing LF only terminates the last record, an empty input is zero
-/// records), and the tree is folded with the same largest-power-of-two split
-/// as `build_tree`, so [`RootStream::finish`] returns exactly
-/// `mth(&split_records(whole))` for the concatenation `whole` of everything
-/// fed.
+/// exactly as [`split_records`] defines — both are driven by the shared
+/// [`RecordSplitter`] (the separator is not content, a trailing LF only
+/// terminates the last record, an empty input is zero records) — and the tree
+/// is folded with the same largest-power-of-two split as `build_tree`, so
+/// [`RootStream::finish`] returns exactly `mth(&split_records(whole))` for
+/// the concatenation `whole` of everything fed.
 ///
 /// Memory use is a small fixed amount plus at most 64 subtree hashes (one per
 /// bit of the record count): nothing grows with the number of bytes fed or
 /// with the length of any single record.
 #[doc(hidden)]
 pub struct RootStream {
+    /// The shared record-splitting state machine: decides which bytes are
+    /// record content and where records end, exactly as it does for
+    /// `split_records` on the `prove` path.
+    splitter: RecordSplitter,
     /// Hasher for the record currently being accumulated, primed with 0x00.
     leaf: Sha256,
-    /// Whether any content byte of the current record has been seen. A record
-    /// only exists once it has content or is terminated by an LF, so an empty
-    /// input is zero records and a trailing LF adds none.
-    record_has_bytes: bool,
     /// Completed subtree hashes, bottom to top in strictly decreasing height;
     /// entry i covers 2^height consecutive leaves. Together the entries are
     /// the binary decomposition of the record count so far, which is exactly
@@ -828,8 +914,8 @@ impl RootStream {
     #[doc(hidden)]
     pub fn new() -> Self {
         RootStream {
+            splitter: RecordSplitter::new(),
             leaf: new_leaf_hasher(),
-            record_has_bytes: false,
             subtrees: Vec::new(),
         }
     }
@@ -838,31 +924,12 @@ impl RootStream {
     /// content; every other byte — space, tab, CR, NUL, non-UTF-8 — is hashed
     /// into the current record as-is.
     #[doc(hidden)]
-    pub fn feed(&mut self, mut chunk: &[u8]) {
-        while let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
-            self.leaf.update(&chunk[..pos]);
-            self.record_has_bytes |= pos > 0;
-            self.finish_record();
-            chunk = &chunk[pos + 1..];
-        }
-        self.leaf.update(chunk);
-        self.record_has_bytes |= !chunk.is_empty();
-    }
-
-    /// Close the current record: finalize its leaf hash and fold it into the
-    /// subtree stack, merging completed subtrees of equal height so the stack
-    /// always holds the largest complete subtrees on the left.
-    fn finish_record(&mut self) {
-        let leaf = std::mem::replace(&mut self.leaf, new_leaf_hasher()).finalize();
-        self.record_has_bytes = false;
-        let mut acc = leaf;
-        let mut height = 0u32;
-        while self.subtrees.last().is_some_and(|&(_, h)| h == height) {
-            let (left, _) = self.subtrees.pop().unwrap();
-            acc = node_hash(&left, &acc);
-            height += 1;
-        }
-        self.subtrees.push((acc, height));
+    pub fn feed(&mut self, chunk: &[u8]) {
+        let RootStream { splitter, leaf, subtrees } = self;
+        splitter.feed(chunk, &mut |event| match event {
+            RecordEvent::RecordBytes(bytes) => leaf.update(bytes),
+            RecordEvent::RecordEnd => fold_record(leaf, subtrees),
+        });
     }
 
     /// Produce the batch root. A final record without a terminating LF counts
@@ -870,8 +937,9 @@ impl RootStream {
     /// empty-tree hash SHA-256("").
     #[doc(hidden)]
     pub fn finish(mut self) -> [u8; 32] {
-        if self.record_has_bytes {
-            self.finish_record();
+        {
+            let RootStream { splitter, leaf, subtrees } = &mut self;
+            splitter.finish(&mut || fold_record(leaf, subtrees));
         }
         match self.subtrees.pop() {
             None => sha256(&[]),
@@ -886,6 +954,21 @@ impl RootStream {
             }
         }
     }
+}
+
+/// Close the record currently accumulated in `leaf`: finalize its leaf hash
+/// and fold it into the subtree stack, merging completed subtrees of equal
+/// height so the stack always holds the largest complete subtrees on the left.
+fn fold_record(leaf: &mut Sha256, subtrees: &mut Vec<([u8; 32], u32)>) {
+    let leaf = std::mem::replace(leaf, new_leaf_hasher()).finalize();
+    let mut acc = leaf;
+    let mut height = 0u32;
+    while subtrees.last().is_some_and(|&(_, h)| h == height) {
+        let (left, _) = subtrees.pop().unwrap();
+        acc = node_hash(&left, &acc);
+        height += 1;
+    }
+    subtrees.push((acc, height));
 }
 
 impl Default for RootStream {
