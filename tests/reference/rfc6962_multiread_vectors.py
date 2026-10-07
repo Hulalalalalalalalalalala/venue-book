@@ -44,7 +44,14 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rfc6962_vectors import mth_fold, mth_recursive, split_records
+from rfc6962_vectors import (
+    audit_path_fold,
+    audit_path_recursive,
+    mth_fold,
+    mth_recursive,
+    split_records,
+    verify_inclusion,
+)
 
 READ_BUF = 64 * 1024  # the fixed read buffer `roottrace root` streams through
 
@@ -199,6 +206,82 @@ def main():
     print()
     print(f"const ROOT_MREAD: &str = \"{root}\";")
     print(f"const ROOT_MREAD_M: &str = \"{root_m}\";")
+
+    # ------------------------------------------------------------------
+    # Inclusion (membership) proofs for the multi-read batch. The two
+    # structurally different path producers from rfc6962_vectors.py (the
+    # RFC 6962 section 2.1.1 recursive PATH definition, and a top-down
+    # descent whose sibling subtree hashes come from the stack fold) must
+    # agree at every one of the ten positions of both batches, and every
+    # path must hash back to the batch root through the independent
+    # recursive inclusion verifier. Nothing here reads roottrace output.
+    #
+    # The fixed vectors emitted for the Rust regression tests cover:
+    #   * m=4 - the 140000-byte record itself (left k=8 subtree)
+    #   * m=9 - the trailing short record (right subtree)
+    # of the original batch MREAD and its one-byte variant MREAD_M.
+    # ------------------------------------------------------------------
+    proof_sequences = [("MREAD", RECORDS, root), ("MREAD_M", RECORDS_M, root_m)]
+    for tag, recs, root_hex in proof_sequences:
+        root_bytes = bytes.fromhex(root_hex)
+        n = len(recs)
+        for m in range(n):
+            p1 = audit_path_recursive(recs, m)
+            p2 = audit_path_fold(recs, m)
+            assert p1 == p2, f"path producers disagree for {tag} m={m}"
+            assert verify_inclusion(recs[m], m, n, p1) == root_bytes, (
+                f"proof does not verify for {tag} m={m}"
+            )
+            assert all(len(h) == 32 for h in p1)
+
+    # Geometry pin-downs for the uneven 10-record tree (split k=8): the long
+    # record at m=4 sits deep in the left subtree, the trailing record m=9 is
+    # in the two-record right subtree. No padding leaf, no duplicated last
+    # record - the unevenness stays inside the tree shape.
+    p4 = audit_path_recursive(RECORDS, 4)
+    p9 = audit_path_recursive(RECORDS, 9)
+    p4m = audit_path_recursive(RECORDS_M, 4)
+    p9m = audit_path_recursive(RECORDS_M, 9)
+    assert len(p4) == 4, f"m=4 in the size-8 left subtree needs 4 siblings, got {len(p4)}"
+    assert len(p9) == 2, f"m=9 in the 2-record right subtree needs 2 siblings, got {len(p9)}"
+
+    # The modified byte lies inside the long record (position 4). Its own
+    # audit path consists solely of sibling SUBTREE hashes, none of which
+    # cover position 4, so that path must be byte-identical after the change.
+    assert p4 == p4m, "the long record's sibling subtrees do not change with its content"
+    # The trailing short record's path contains the left size-8 subtree hash,
+    # which commits to the long record, so its deepest sibling must change.
+    assert p9 != p9m, "the last record's path must commit to the changed long subtree"
+    # Leaf-to-root order: for m=9 the last sibling is the size-8 left subtree.
+    assert p9[-1] == mth_recursive(RECORDS[:8])
+    assert p9m[-1] == mth_recursive(RECORDS_M[:8])
+    assert p9[:-1] == p9m[:-1], "only the long-record subtree hash changes for m=9"
+
+    def emit_proof(const_tag, recs, m, root_hex):
+        path = audit_path_recursive(recs, m)
+        print(f"# Inclusion proof for {const_tag}: n={len(recs)}, m={m}; "
+              f"both independent path producers agree and the path verifies "
+              f"back to the fixed root.")
+        elems = ",\n    ".join(f"\"{h.hex()}\"" for h in path)
+        print(f"const PATH_{const_tag}: &[&str] = &[\n    {elems},\n];")
+        print()
+
+    print()
+    print("# Fixed inclusion-proof vectors (RFC 6962 section 2.1.1,")
+    print("# leaf-to-root order, lowercase hex): m=4 is the 140000-byte")
+    print("# record, m=9 the trailing short record.")
+    print()
+    emit_proof("MREAD_M4", RECORDS, 4, root)
+    emit_proof("MREAD_M9", RECORDS, 9, root)
+    emit_proof("MREAD_M_M4", RECORDS_M, 4, root_m)
+    emit_proof("MREAD_M_M9", RECORDS_M, 9, root_m)
+
+    # Cross-case negative check: the ORIGINAL m=4 proof must NOT verify the
+    # modified long record against the original (still trusted) root.
+    assert verify_inclusion(LONG_M, 4, 10, audit_path_recursive(RECORDS, 4)) \
+        != bytes.fromhex(root), "the stale proof unexpectedly verifies"
+    print("# Negative vector: PATH_MREAD_M4 + modified record LONG_M + trusted")
+    print("# ROOT_MREAD must NOT verify (verification failure, not a malformed proof).")
 
 
 if __name__ == "__main__":
