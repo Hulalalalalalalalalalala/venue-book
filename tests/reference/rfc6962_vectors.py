@@ -31,6 +31,14 @@ hashes and the root an honest verifier must recompute is derived two
 structurally different ways (recursive descent, and an iterative top-down
 turn walk folded leaf-to-root), which must agree.
 
+A closing section fixes vectors for records whose CONTENT contains LF bytes
+(unexpressible in a batch file): a 70-byte record with leading/consecutive/
+trailing LFs plus CR, NUL and non-UTF-8 bytes, and a record that is exactly
+one LF, each committed in a single-record tree and in an uneven 9-record
+tree built from record lists. Tampered forms (trailing LF dropped, one
+internal LF changed, any single LF-separated "line") are asserted to
+recombine to different roots.
+
 Records are split exactly as roottrace documents: raw bytes on LF, the
 separator excluded, a trailing LF only terminates the last record, and an
 empty file holds zero records.
@@ -655,6 +663,106 @@ def main():
         print(f"    BigCase {{ size: {n}, index: {m}, depth: {len(path)}, "
               f"root: \"{r1.hex()}\" }},")
     print("];")
+
+    # ------------------------------------------------------------------
+    # Records whose CONTENT contains LF bytes.
+    #
+    # verify's record file and the library's record slice are the whole
+    # record: an LF inside is content, never a separator; a trailing LF is
+    # content, never a terminator. Such a record cannot be expressed in a
+    # root/prove batch file (LF is the record separator there), but an
+    # external system can commit to the raw bytes directly and produce an
+    # RFC 6962 inclusion proof for them. The trees below are therefore
+    # built from record LISTS, never from join_lf file bytes, and are
+    # cross-checked by the same two independent algorithm pairs as above.
+    # ------------------------------------------------------------------
+
+    # LF_REC: starts with an LF, holds a run of consecutive LFs inside,
+    # ends with an LF, and also carries CR, NUL and non-UTF-8 bytes. Its 70
+    # bytes (leaf input 0x00 || record = 71 bytes) cross the 64-byte
+    # SHA-256 block boundary.
+    LF_REC = (
+        b"\n"                    # leading LF: content, not a separator
+        b"LF:\x00\xff\xfe\r"     # tag plus NUL, non-UTF-8 and CR content
+        b"\n\n\n"                # consecutive LFs: content, not empty records
+    )
+    fill = b"abcdefghijklmnopqrstuvwxyz0123456789"
+    i = 0
+    while len(LF_REC) < 69:
+        LF_REC += bytes([fill[i % len(fill)]])
+        i += 1
+    LF_REC += b"\n"              # trailing LF: content, not a terminator
+    assert len(LF_REC) == 70 and 1 + len(LF_REC) > 64
+    assert LF_REC[0] == 0x0A and LF_REC[-1] == 0x0A
+    assert 0x00 in LF_REC and 0x0D in LF_REC and any(b >= 0x80 for b in LF_REC)
+
+    # A record that is exactly one LF: neither the zero-byte empty record
+    # nor the empty record a batch file containing one LF denotes.
+    ONE_LF_REC = b"\n"
+
+    # Uneven 9-record tree (RFC split k=8) holding both LF-containing
+    # records at positions 2 and 5. No batch file can denote this sequence.
+    LF9 = [
+        b"alpha",             # 0
+        b"",                  # 1 empty record
+        ONE_LF_REC,           # 2 exactly one LF
+        b"gamma",             # 3
+        b"\xff\xfe\x00bin",   # 4 NUL + non-UTF-8 bytes
+        LF_REC,               # 5 the LF-laden record
+        b"delta\r",           # 6 trailing CR is content
+        b"epsilon",           # 7
+        b"zeta\x01tail",      # 8
+    ]
+
+    lf9_root_a, lf9_root_b = mth_recursive(LF9), mth_fold(LF9)
+    assert lf9_root_a == lf9_root_b, "reference algorithms disagree"
+    for m in (2, 5):
+        p1 = audit_path_recursive(LF9, m)
+        p2 = audit_path_fold(LF9, m)
+        assert p1 == p2, f"path producers disagree for LF9 m={m}"
+        assert verify_inclusion(LF9[m], m, 9, p1) == lf9_root_a
+
+    # Single-record trees: empty audit path, root is the leaf hash itself.
+    lf_single_root = mth_recursive([LF_REC])
+    assert lf_single_root == sha256(b"\x00" + LF_REC)
+    one_lf_single_root = mth_recursive([ONE_LF_REC])
+    assert one_lf_single_root == sha256(b"\x00" + ONE_LF_REC)
+    # The one-LF record is not the empty record: different roots, and the
+    # empty record does not verify against the one-LF record's proof.
+    assert one_lf_single_root != mth_recursive([b""])
+    assert verify_inclusion(b"", 0, 1, []) != one_lf_single_root
+
+    # Tampered forms must recombine to a different root: dropping the
+    # trailing LF, or changing one internal LF (index 9, the middle of the
+    # consecutive run) while keeping every other byte.
+    lf_no_tail = LF_REC[:-1]
+    assert LF_REC[9] == 0x0A
+    lf_swap = LF_REC[:9] + b"X" + LF_REC[10:]
+    assert len(lf_swap) == len(LF_REC) and lf_swap != LF_REC
+    path_m5 = audit_path_recursive(LF9, 5)
+    for tampered in (lf_no_tail, lf_swap):
+        assert verify_inclusion(tampered, 0, 1, []) != lf_single_root
+        assert verify_inclusion(tampered, 5, 9, path_m5) != lf9_root_a
+    # No single "line" of LF_REC verifies as the record: verification must
+    # not fall back to matching one of the LF-separated pieces.
+    for line in LF_REC.split(b"\n"):
+        assert verify_inclusion(line, 5, 9, path_m5) != lf9_root_a
+
+    print()
+    print("# Records containing LF bytes (every LF is content; unexpressible")
+    print("# in a batch file). Roots and paths are fixed by the same two")
+    print("# independent algorithm pairs as above; tampered forms and single")
+    print("# LF-separated 'lines' re-verify to different roots.")
+    print("# Used by tests/verify_record_lf_regression.rs.")
+    print(f"const REC_LF: &[u8] = {rust_byte_string(LF_REC)};")
+    print(f"const REC_ONE_LF: &[u8] = {rust_byte_string(ONE_LF_REC)};")
+    print(f"const ROOT_LF_REC_SINGLE: &str = \"{lf_single_root.hex()}\";")
+    print(f"const ROOT_ONE_LF_REC_SINGLE: &str = \"{one_lf_single_root.hex()}\";")
+    print(f"const ROOT_LF9: &str = \"{lf9_root_a.hex()}\";")
+    for m, name in ((2, "PATH_LF9_M2"), (5, "PATH_LF9_M5")):
+        path = audit_path_recursive(LF9, m)
+        elems = ", ".join(f"\"{h.hex()}\"" for h in path)
+        print(f"const {name}: &[&str] = &[{elems}];")
 
 
 if __name__ == "__main__":
