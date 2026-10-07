@@ -6,8 +6,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use roottrace::{
-    claims_json, hex, hex_nibble, inspect_proof, is_lower_hex, proof_json, root_and_path,
-    split_records, RootStream,
+    claims_json, hex, hex_nibble, inspect_proof, is_lower_hex, prove_membership, split_records,
+    RootStream,
 };
 
 const VERSION: &str = "0.1.0";
@@ -100,11 +100,11 @@ fn main() -> ExitCode {
                     println!("{}", proof);
                     ExitCode::SUCCESS
                 }
-                Err(ProveError::Read(reason)) => {
+                Err(CliProveError::Read(reason)) => {
                     eprintln!("roottrace: {reason}");
                     ExitCode::FAILURE
                 }
-                Err(ProveError::Missing(index, size)) => {
+                Err(CliProveError::Missing(index, size)) => {
                     if size == 0 {
                         eprintln!(
                             "roottrace: record index {index} does not exist: the file holds zero records"
@@ -194,7 +194,12 @@ fn main() -> ExitCode {
     }
 }
 
-enum ProveError {
+/// Failures specific to the command line's `prove` wrapper: a batch file that
+/// cannot be read, or a requested position the batch does not contain. The
+/// position case comes from the library entry point
+/// `roottrace::prove_membership`; this CLI-only enum keeps the separate
+/// read-error arm the command's exit-code handling needs.
+enum CliProveError {
     Read(String),
     Missing(u64, u64),
 }
@@ -328,17 +333,20 @@ fn merkle_root_of_file(path: &Path) -> Result<[u8; 32], String> {
     Ok(stream.finish())
 }
 
-fn proof_for_file(path: &Path, index: u64) -> Result<String, ProveError> {
+fn proof_for_file(path: &Path, index: u64) -> Result<String, CliProveError> {
     let data = fs::read(path)
-        .map_err(|e| ProveError::Read(format!("cannot read '{}': {e}", display_path(path))))?;
+        .map_err(|e| CliProveError::Read(format!("cannot read '{}': {e}", display_path(path))))?;
     let records = split_records(&data);
-    let size = records.len() as u64;
-    if index >= size {
-        return Err(ProveError::Missing(index, size));
+    // The library entry point performs the full-width range check and builds
+    // the root and audit path with the shared RFC 6962 tree constructor; the
+    // CLI only adds the LF division of the batch file.
+    match prove_membership(&records, index) {
+        Ok(proof) => Ok(proof.to_json()),
+        Err(roottrace::ProveError::PositionNotFound {
+            requested_index,
+            record_count,
+        }) => Err(CliProveError::Missing(requested_index, record_count)),
     }
-    let idx = index as usize;
-    let (root, audit_path) = root_and_path(&records, idx);
-    Ok(proof_json(size, index, &root, &audit_path))
 }
 
 /// Read a proof file and return the one-line JSON object `inspect` prints:

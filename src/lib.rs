@@ -26,6 +26,22 @@
 //! 值，请改用 [`inspect_proof`]：它做同样的完整格式解读，但不做成员核验，
 //! 其结果 [`ProofClaims`] 中的大小与根值直接来自证明、不可当作可信输入。
 //!
+//! # 直接在内存中生成证明
+//!
+//! [`verify_membership`] 消费一份已有证明；要在没有批次文件、不调用命令行
+//! 的情况下**生成**证明，请用 [`prove_membership`]：传入内存中已经划分好
+//! 的有序记录批次（每个元素就是一条完整记录）和一个从 0 开始的序号，
+//! 成功即得到 [`InclusionProof`]，可读取树大小、序号、32 字节根值与从叶子
+//! 到根排列的兄弟哈希，并用 [`InclusionProof::to_json`] 取得与
+//! `roottrace prove` 逐字节一致的一行 JSON（不含行末换行）。
+//!
+//! 批次中的每个元素就是一条完整记录，本函数**不**按记录内容里的 LF
+//! 拆分：开头、内部或末尾的 LF、CR、空格、NUL 与非 UTF-8 字节都属于该
+//! 记录。因此“记录本身含有 LF”的批次——无法用 LF 分隔的批次文件表达——
+//! 也能直接生成证明。空切片元素占一个位置（一条空记录），与零个元素的
+//! 空批次不同；序号达到或超过记录数（含空批次）时返回按类型识别的
+//! [`ProveError::PositionNotFound`]，并携带请求序号与实际记录数。
+//!
 //! # 示例
 //!
 //! ```
@@ -228,6 +244,207 @@ pub fn inspect_proof(proof: &[u8]) -> Result<ProofClaims, InspectError> {
         tree_size: proof.tree_size,
         leaf_index: proof.leaf_index,
         root: proof.root,
+    })
+}
+
+// --- 直接在内存中生成成员证明 --------------------------------------------------
+
+/// 在内存中生成的成员证明：批次根值、记录位置与从叶子到根排列的兄弟哈希。
+///
+/// 由 [`prove_membership`] 直接在内存中产生，无需批次文件或临时文件，也不
+/// 经过命令行。字段与 `roottrace prove` 输出的 JSON 完全一致，可经
+/// [`InclusionProof::to_json`] 取得逐字节相同的一行 JSON（无行末换行），并
+/// 直接交给 [`inspect_proof`]、[`verify_membership`] 或命令行的
+/// `inspect`/`verify`。
+///
+/// 与 [`ProofClaims`] 一样，这里的 `tree_size()` 与 `root()` **只描述调用方
+/// 自己提交的批次**，不代表它们已经获得任何外部信任：把证明发给别人时，
+/// 对方仍须用独立渠道确认树大小和根值后再用 [`verify_membership`] 核验。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InclusionProof {
+    tree_size: u64,
+    leaf_index: u64,
+    root: [u8; 32],
+    audit_path: Vec<[u8; 32]>,
+}
+
+impl InclusionProof {
+    /// 完整批次的记录数（证明 JSON 中的 `tree_size`），保持完整 64 位
+    /// 无符号整数含义。
+    pub fn tree_size(&self) -> u64 {
+        self.tree_size
+    }
+
+    /// 被证明记录从 0 开始的序号（证明 JSON 中的 `leaf_index`），即调用
+    /// [`prove_membership`] 时给出的位置。
+    pub fn leaf_index(&self) -> u64 {
+        self.leaf_index
+    }
+
+    /// 整个批次的 32 字节 RFC 6962 Merkle Tree Hash（证明 JSON 中的
+    /// `root`），与 `roottrace root` 对同一记录序列给出的根值完全相同。
+    pub fn root(&self) -> &[u8; 32] {
+        &self.root
+    }
+
+    /// 从叶子向根排列的兄弟哈希（证明 JSON 中的 `audit_path`）。批次只有
+    /// 一条记录时为空；非二次幂批次按 RFC 6962 的不均匀子树排列，既不
+    /// 复制末尾记录也不补空记录。
+    pub fn audit_path(&self) -> &[[u8; 32]] {
+        &self.audit_path
+    }
+
+    /// 与 `roottrace prove` 逐字节一致的单行 JSON 证明（紧凑形式、字段顺序
+    /// 固定、小写十六进制哈希），**不含**行末换行，也不包含原始记录。需要
+    /// 写入文件或交给命令行时由调用方自行添加换行。
+    ///
+    /// 当记录序列可以用 LF 分隔的批次文件表示时，这里的输出与
+    /// `roottrace prove <批次文件> <序号>` 去掉行末换行后的输出逐字节相同；
+    /// 记录本身含 LF（批次文件无法表达）时，输出仍是同一格式的合法证明。
+    pub fn to_json(&self) -> String {
+        proof_json(self.tree_size, self.leaf_index, &self.root, &self.audit_path)
+    }
+}
+
+/// 直接在内存中生成成员证明失败的分类。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProveError {
+    /// 请求的位置在批次中不存在：序号达到或超过记录数。空批次（零条记录）
+    /// 对任何序号都报这一类错误，而不是产生一份“空树成员证明”。附带
+    /// `requested_index`（调用方请求的序号，完整保留 64 位含义）与
+    /// `record_count`（批次实际记录数）。
+    PositionNotFound {
+        /// 调用方请求的从 0 开始的记录序号。
+        requested_index: u64,
+        /// 批次实际包含的记录数。
+        record_count: u64,
+    },
+}
+
+impl fmt::Display for ProveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProveError::PositionNotFound {
+                requested_index,
+                record_count,
+            } => {
+                if *record_count == 0 {
+                    write!(
+                        f,
+                        "record index {requested_index} does not exist: the batch holds zero records"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "record index {requested_index} does not exist: batch holds {record_count} record(s), valid indices are 0 through {}",
+                        record_count - 1
+                    )
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProveError {}
+
+/// 直接为内存中的有序记录批次生成 RFC 6962 第 2.1.1 节成员证明。
+///
+/// - `records`：已经划分好的有序记录批次。**批次中的每个元素就是一条完整
+///   记录**，本函数不按记录内容里的 LF 再做任何拆分、修剪或替换：开头、
+///   内部或末尾的 LF、CR、空格、NUL 与非 UTF-8 字节都属于该记录内容。
+///   这让“记录本身含有 LF”的批次也能直接生成证明——这种序列无法用
+///   `root`/`prove` 的 LF 分隔批次文件表达。空切片元素（`b""`）占一个
+///   位置（一条空记录），与零个元素的空批次不同；重复内容按实际位置
+///   保留，记录顺序参与根值计算。
+///
+///   参数接受任何可按引用迭代出字节串的集合：`&[&[u8]]`、`&[Vec<u8>]`、
+///   `Vec<Vec<u8>>`（按值移入）、数组等均可。
+/// - `leaf_index`：从 0 开始的记录序号，按 `records` 的顺序定位。相同内容
+///   出现在多个位置时，生成的是该序号指定位置的证明，不会改成前一次出现
+///   的位置。序号达到或超过记录数（含空批次）时返回
+///   [`ProveError::PositionNotFound`]，其中携带请求序号与实际记录数；
+///   序号按完整的 `u64` 处理，较大值不会被截断后误选一个合法位置。
+///
+/// 成功返回 [`InclusionProof`]：可读取树大小、记录序号、32 字节根值与从
+/// 叶子到根排列的兄弟哈希，并经 [`InclusionProof::to_json`] 取得与
+/// `roottrace prove` 逐字节一致的单行 JSON（无行末换行）。该函数不向标准
+/// 输出或标准错误打印任何内容；返回的根值只是对调用方所提交批次的描述，
+/// 不代表它已获得外部信任。
+///
+/// # 示例
+///
+/// ```
+/// use roottrace::prove_membership;
+///
+/// // 三条记录的批次；每条元素就是一条完整记录。
+/// let records: [&[u8]; 3] = [b"a", b"b", b"c"];
+/// let proof = prove_membership(&records, 1).expect("position 1 exists");
+/// assert_eq!(proof.tree_size(), 3);
+/// assert_eq!(proof.leaf_index(), 1);
+/// assert_eq!(proof.audit_path().len(), 2);
+/// // JSON 与 `roottrace prove` 的输出逐字节一致（这里不含行末换行）。
+/// assert_eq!(
+///     proof.to_json(),
+///     "{\"tree_size\":3,\"leaf_index\":1,\"root\":\"36642e73c2540ab121e3a6bf9545b0a24982cd830eb13d3cd19de3ce6c021ec1\",\"audit_path\":[\"022a6979e6dab7aa5ae4c3e5e45f7e977112a7e63593820dbec1ec738a24f93c\",\"597fcb31282d34654c200d3418fca5705c648ebf326ec73d8ddef11841f876d8\"]}"
+/// );
+///
+/// // 记录本身含 LF：批次文件无法表达，这里每个元素仍只算一条记录。
+/// let lf_records: [&[u8]; 1] = [b"line-1\nline-2\n"];
+/// let single = prove_membership(&lf_records, 0).expect("position 0 exists");
+/// assert_eq!(single.tree_size(), 1);
+/// assert!(single.audit_path().is_empty()); // 只有一条记录，路径为空
+///
+/// // 空批次对任何序号都返回可按类型识别的“位置不存在”。
+/// let empty: [&[u8]; 0] = [];
+/// assert!(matches!(
+///     prove_membership(&empty, 0),
+///     Err(roottrace::ProveError::PositionNotFound { requested_index: 0, record_count: 0 })
+/// ));
+/// ```
+pub fn prove_membership<I, R>(records: I, leaf_index: u64) -> Result<InclusionProof, ProveError>
+where
+    I: IntoIterator<Item = R>,
+    R: AsRef<[u8]>,
+{
+    // Hold every element for the whole call. Each element is ALREADY one
+    // complete record: no LF splitting, trimming or replacement happens here,
+    // so a record whose own bytes contain LF is a single leaf. A zero-length
+    // collection is the empty batch, distinct from one element that is empty.
+    let owned: Vec<R> = records.into_iter().collect();
+    let slices: Vec<&[u8]> = owned.iter().map(AsRef::as_ref).collect();
+    prove_membership_from_slices(&slices, leaf_index)
+}
+
+/// Slice-based core shared by [`prove_membership`] and the `prove` command:
+/// range-check the position, then build the root and one leaf-to-root audit
+/// path with the single shared [`build_tree`] constructor, so the library and
+/// the command line can never disagree on the tree or the path.
+fn prove_membership_from_slices(
+    records: &[&[u8]],
+    leaf_index: u64,
+) -> Result<InclusionProof, ProveError> {
+    // `records.len()` is at most usize::MAX and hence always fits in u64, so
+    // the full-width comparison happens BEFORE any narrowing to usize: a large
+    // `leaf_index` is reported as a missing position, never truncated into a
+    // legal one.
+    let count = records.len() as u64;
+    if leaf_index >= count {
+        // Empty batch and out-of-range index are the same typed condition; the
+        // two carried values let the caller tell them apart and log precisely.
+        return Err(ProveError::PositionNotFound {
+            requested_index: leaf_index,
+            record_count: count,
+        });
+    }
+    // In range, so this narrowing is always in bounds.
+    let idx = leaf_index as usize;
+    let mut audit_path = Vec::new();
+    let root = build_tree(records, Some(idx), &mut audit_path);
+    Ok(InclusionProof {
+        tree_size: count,
+        leaf_index,
+        root,
+        audit_path,
     })
 }
 

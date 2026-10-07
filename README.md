@@ -150,6 +150,23 @@ LF 时输出逐字节相同；长记录后半段仅改动一个非 LF 字节后�
 空白与等价转义被接受而重复字段仍被拒绝；重复内容只按声明位置核验；2^63、
 2^63+1、2^64-1 的树大小与超过 32 位的序号保持完整 64 位含义。
 
+`tests/library_prove.rs` 把 roottrace 当作**库**来检验内存中的证明**生成**
+入口 `prove_membership`：对批次文件能表达的序列（1、7、8、9 条，跨过二次幂
+边界），在文件末尾 LF 有无两种形式下，逐位置校验生成的单行 JSON 与实际
+`prove` 命令输出去掉行末换行后**逐字节一致**、根值与 `root` 命令相同；
+`InclusionProof` 的树大小、序号、根值与从叶到根兄弟哈希读取正确，只有一条
+记录时路径为空，9 条记录末条路径恰为前 8 条的 MTH（不复制末条、不补空记录）。
+记录本身含 LF、CR、NUL 与非 UTF-8 字节（批次文件无法表达）时，单记录树与
+9 条非二次幂树的根值和审计路径逐字节等于独立脚本
+`tests/reference/rfc6962_lf_record_vectors.py` 固定的常量，生成的 JSON 再用
+完整记录字节与独立可信值经 `verify_membership` 与命令行 `verify`/`inspect`
+核验成功；内嵌 LF 不被当成分隔符。空切片元素占一个位置而空批次没有任何位置；
+重复内容指定靠后出现的位置时不被改成前一次；序号越界、空批次以及 u64::MAX
+等高序号都返回按类型识别的 `ProveError::PositionNotFound`，并原样携带请求
+序号与实际记录数（高序号不被截断成合法位置），既不 panic 也不返回残缺证明；
+JSON 为不含行末换行的单行，并接受 `&[&[u8]]`、`&[Vec<u8>]`、按值的
+`Vec<Vec<u8>>` 与固定数组等多种批次传参形式。
+
 `tests/verify_big_tree_regression.rs` 对**大树**（树大小接近 64 位无符号整数上限）
 的核验做端到端保障：树大小为 9223372036854775808（2^63，二次幂树）、
 9223372036854775809（2^63+1，不均匀树）与 18446744073709551615（2^64-1，不均匀
@@ -425,7 +442,9 @@ roottrace 0.1.0
 
 除命令行外，roottrace 同时是一个 Rust 库：其他 Rust 程序可以直接在内存中
 核验成员证明，无需准备完整批次或临时文件。在 `Cargo.toml` 中把本包加入
-`[dependencies]` 后，成员核验的入口是 `roottrace::verify_membership`。
+`[dependencies]` 后，成员核验的入口是 `roottrace::verify_membership`；
+要在内存中直接**生成**成员证明（无需批次文件或命令行，连记录本身含 LF
+的批次也行），入口是 `roottrace::prove_membership`。
 
 下面用一个**含重复记录的小批次**给出可以整段复制的完整示例：记录、证明、
 可信值全部作为常量硬编码在程序里，复制后即可编译运行并得到真实的核验结果，
@@ -619,6 +638,99 @@ inspect：证明自称 位置 2、树大小 4、根值 e63979768f9a2e746fa65d9bc
 让证明自我背书。可信值仍须来自 `roottrace root`、签名公告或带外账本等
 独立渠道。证明格式无效时返回 `InspectError::MalformedProof`；命令行的
 `inspect` 子命令就建立在这个函数之上。
+
+### `prove_membership` 直接在内存中生成证明
+
+`verify_membership` 需要一份已经存在的证明；要在**没有批次文件、也不调用
+命令行**的情况下直接生成证明，用
+
+```rust
+roottrace::prove_membership<I, R>(records: I, leaf_index: u64)
+    -> Result<InclusionProof, ProveError>
+```
+
+其中 `records` 是内存中一个已经划分好的有序记录批次，`leaf_index` 是从 0
+开始的序号。它接受任何可按引用迭代出字节串的集合：`&[&[u8]]`、`&[Vec<u8>]`、
+按值传入的 `Vec<Vec<u8>>`、固定数组等都可以。成功返回的 `InclusionProof`
+提供这些读取方法：
+
+- `tree_size() -> u64`：整个批次的记录数；
+- `leaf_index() -> u64`：被证明记录的序号（即你传入的位置）；
+- `root() -> &[u8; 32]`：整个批次的 32 字节根值，与 `roottrace root` 对同一
+  记录序列的结果完全相同；
+- `audit_path() -> &[[u8; 32]]`：从叶子到根排列的兄弟哈希，只有一条记录时
+  为空；
+- `to_json() -> String`：与 `roottrace prove` **逐字节一致**的单行 JSON
+  （紧凑形式、固定字段顺序、小写十六进制），**不含**行末换行，也不包含
+  原始记录。需要写入文件或交给命令行时由你自行补一个换行。
+
+**记录边界（重要）：** 与命令行的批次文件不同，传给 `prove_membership` 的
+批次**不会再按 LF 拆分**——集合中的**每个元素就是一条完整记录**。记录开头、
+内部或末尾的 LF，以及 CR、空格、NUL 和非 UTF-8 字节，全部属于该记录内容，
+不修剪也不替换。因此元素 `b"a\nb"` 是**一条**内容含 LF 的记录，而不是
+`a`、`b` 两条。空切片 `b""` 元素占**一个**位置（一条空记录，根值为
+`6e340b9c...` 的 `SHA-256(0x00)`），它与零个元素的**空批次**是两回事；
+重复内容按实际位置保留，指定靠后那次出现的位置不会被改成前一次；记录顺序
+参与根值计算。这让“记录本身含 LF”的批次也能直接生成证明——这种序列无法
+用 LF 分隔的批次文件表达。
+
+下面这段在前面 4 条记录批次（`alpha/beta/alpha/gamma`）上直接生成位置 2
+的证明，输出的 JSON 与文档前面 `roottrace prove batch.txt 2` 的那一行
+逐字节相同：
+
+```rust
+use roottrace::{prove_membership, ProveError};
+
+let records: [&[u8]; 4] = [b"alpha", b"beta", b"alpha", b"gamma"];
+let proof = prove_membership(&records, 2).expect("位置 2 存在");
+assert_eq!(proof.tree_size(), 4);
+assert_eq!(proof.leaf_index(), 2);
+assert_eq!(
+    proof.to_json(),
+    "{\"tree_size\":4,\"leaf_index\":2,\"root\":\"e63979768f9a2e746fa65d9bc2b3c0c97346fa29188b7346912c9a462b0a4b56\",\"audit_path\":[\"4c79d0d62f7cf5ca8874155f2d3b875f2625da2bb3abc86bbd6833f25ba90e51\",\"983cb57c04cddd52634edab38a7bef85708a974f114bbd9aa9ec5d4ce6656b4b\"]}"
+);
+```
+
+含 LF 的记录直接作为一个元素即可；只有一条记录时审计路径为空：
+
+```rust
+// 一条以 LF 开头、内部有 LF、末尾也是 LF 的完整记录（批次文件无法表达）。
+let lf_batch: [&[u8]; 1] = [b"\nline-1\nline-2\n"];
+let single = roottrace::prove_membership(&lf_batch, 0).unwrap();
+assert_eq!(single.tree_size(), 1);
+assert!(single.audit_path().is_empty());
+
+// 生成结果可直接交给核验；可信值须独立确认，不能直接照抄证明里的 root。
+let record = lf_batch[0];
+let size = single.tree_size();
+let trusted_root = *single.root(); // 示例中就地取得；真实场景应来自独立渠道
+roottrace::verify_membership(record, single.to_json().as_bytes(), size, &trusted_root)
+    .expect("用完整记录字节和可信值核验成功");
+```
+
+**错误结果：** 序号达到或超过记录数时返回
+`ProveError::PositionNotFound { requested_index, record_count }`——一个可按
+**类型**识别的错误，携带你请求的序号（完整 64 位，不截断）和批次实际记录
+数。空批次对任何序号都返回这同一类错误，而不是异常终止或给出一份“空树
+成员证明”：
+
+```rust
+let empty: [&[u8]; 0] = [];
+match roottrace::prove_membership(&empty, 0) {
+    Err(ProveError::PositionNotFound { requested_index, record_count }) => {
+        assert_eq!(requested_index, 0);
+        assert_eq!(record_count, 0); // 空批次
+    }
+    Ok(_) => panic!("空批次没有任何可证明的位置"),
+}
+```
+
+非二次幂的奇数条记录继续沿用 RFC 6962 的不均匀树形，既不复制末条也不补空
+记录（例如 9 条记录时末条的证明只有一个哈希，即前 8 条的 MTH）。生成的
+JSON 可直接交给 `inspect_proof`、`verify_membership` 以及命令行的
+`inspect`/`verify`。需要提醒：`prove_membership` 返回的 `root()` 只是对你
+**自己提交的批次**的计算结果，并不代表它已经获得外部信任；把证明发给别人
+时，对方仍应通过独立渠道确认树大小和根值。
 
 ### 其他约定
 
