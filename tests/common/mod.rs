@@ -6,6 +6,8 @@
 // this module (e.g. TempDir is only needed by root_regression).
 #![allow(dead_code)]
 
+pub mod read_fault;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
