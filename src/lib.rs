@@ -652,19 +652,170 @@ fn include_record(
     Ok(root)
 }
 
-/// Split raw bytes into records on LF (0x0a). The separator is not part of
-/// any record. A trailing LF terminates the last record without adding an
-/// empty one; an empty file yields zero records.
+// --- Record division --------------------------------------------------------
+//
+// This is the SINGLE place that maintains how a raw byte batch is divided into
+// records. Both commands drive the same rule:
+//
+// - `prove` scans an already-read batch with [`RecordScanner::scan`], collecting
+//   one slice per record ([`split_records`]);
+// - `root` feeds its fixed-size read buffer chunk by chunk to the same
+//   [`RecordScanner`] inside [`RootStream`], so a read boundary is never a
+//   record boundary.
+//
+// The rule, byte for byte:
+//
+// - LF (0x0a) separates records and is never itself content. Every other byte
+//   — CR, space, tab, NUL, a non-UTF-8 byte — is content delivered verbatim;
+//   there is no text decoding, trimming or newline normalization.
+// - A record comes into existence either by receiving content or by being
+//   terminated with an LF. Leading and consecutive LFs therefore keep their
+//   empty records; an empty input is zero records, while a single LF is one
+//   empty record.
+// - A trailing LF only terminates the record in progress and adds no empty
+//   record; a final record without a trailing LF is the same record sequence.
+//
+// The division is expressed as an event sink ([`RecordSink`]) rather than as a
+// returned list, so the streaming caller never has to accumulate a complete
+// record or batch: `record_bytes` hands out sub-slices straight from the chunk
+// being scanned.
+
+/// Receives the division of a byte stream into records from
+/// [`RecordScanner`]. Every method sees raw bytes only; the scanner alone
+/// decides *when* each event fires, so a sink never re-interprets LF or the
+/// end of stream.
+trait RecordSink {
+    /// A non-empty run of content bytes belonging to the record currently in
+    /// progress; the slice is borrowed from the chunk being scanned and must
+    /// not be relied on after the call returns. One record arrives as any
+    /// number of these runs (a long record spanning many chunks gets many),
+    /// but an empty record gets none.
+    fn record_bytes(&mut self, bytes: &[u8]);
+
+    /// One record was terminated by an LF (which is never delivered as
+    /// content). Fires for every LF in the stream, including a leading LF and
+    /// the second of two consecutive LFs — those close empty records.
+    fn record_end(&mut self);
+
+    /// The stream ended right after content bytes with no terminating LF, so
+    /// that content is itself the final record. Fires at most once, only when
+    /// such content exists; after a bare trailing LF it does not fire.
+    fn tail_end(&mut self);
+}
+
+/// The shared record-boundary state machine. Independent of how the bytes are
+/// obtained: one whole batch ([`RecordScanner::scan`]) or arbitrarily sized
+/// chunks fed across reads ([`RecordScanner::feed`]) divide into exactly the
+/// same record sequence. The only state it keeps is whether a content-only
+/// record is open at the end of the last chunk, so nothing grows with the
+/// number of records or their length.
+struct RecordScanner<S: RecordSink> {
+    sink: S,
+    /// Content has arrived for the record currently in progress and no LF has
+    /// closed it yet. Decides whether [`RecordSink::tail_end`] fires at end of
+    /// stream — the one place the "trailing LF adds no record" rule lives.
+    open: bool,
+}
+
+impl<S: RecordSink> RecordScanner<S> {
+    fn new(sink: S) -> Self {
+        RecordScanner { sink, open: false }
+    }
+
+    /// Feed the next chunk. Read boundaries fall inside content or on LF
+    /// bytes; either way the division sees no boundary of its own — an LF split
+    /// across two chunks still ends the record, and two LFs in adjacent chunks
+    /// keep the empty record between them.
+    fn feed(&mut self, chunk: &[u8]) {
+        let mut rest = chunk;
+        while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+            // Content before this LF (nothing for a leading/consecutive LF);
+            // the empty-run case must not look like content.
+            if pos > 0 {
+                self.sink.record_bytes(&rest[..pos]);
+            }
+            self.sink.record_end();
+            rest = &rest[pos + 1..];
+            self.open = false;
+        }
+        // Bytes after the last LF (or all of an LF-free chunk) open the
+        // record the next chunk or end of stream will close.
+        if !rest.is_empty() {
+            self.sink.record_bytes(rest);
+            self.open = true;
+        }
+    }
+
+    /// Finish the stream and give back the sink.
+    fn finish(mut self) -> S {
+        if self.open {
+            self.sink.tail_end();
+        }
+        self.sink
+    }
+
+    /// Convenience for callers that already hold the whole input: divide it in
+    /// one pass.
+    fn scan(self, data: &[u8]) -> S {
+        let mut scanner = self;
+        scanner.feed(data);
+        scanner.finish()
+    }
+}
+
+/// Divide a complete batch into records on LF (0x0a), per the shared rule
+/// documented on [`RecordScanner`]. The separator is not part of any record; a
+/// trailing LF terminates the last record without adding an empty one; an empty
+/// file yields zero records and a file containing one LF yields one empty
+/// record.
 #[doc(hidden)]
 pub fn split_records(data: &[u8]) -> Vec<&[u8]> {
-    if data.is_empty() {
-        return Vec::new();
+    /// Sink for the whole-batch case: content runs of one record are stitched
+    /// back into slice positions. A run never crosses a chunk boundary here
+    /// (the whole batch is one feed), but every record goes through the same
+    /// content/end events as the streaming path.
+    struct CollectRecords<'a> {
+        data: &'a [u8],
+        records: Vec<&'a [u8]>,
+        /// Start offset of the record currently in progress. `None` until the
+        /// record actually receives content: a record exists only once it has
+        /// content or is terminated by an LF, so an empty input stays empty.
+        start: Option<usize>,
+        pos: usize,
     }
-    let mut records: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
-    if data.last() == Some(&b'\n') {
-        records.pop();
+
+    impl<'a> RecordSink for CollectRecords<'a> {
+        fn record_bytes(&mut self, bytes: &[u8]) {
+            // The scanner only calls this with non-empty content; the first run
+            // of a record opens it at the byte it starts at.
+            if self.start.is_none() {
+                self.start = Some(self.pos);
+            }
+            self.pos += bytes.len();
+        }
+
+        fn record_end(&mut self) {
+            // Termination by LF always closes a record, even an empty one.
+            let start = self.start.take().unwrap_or(self.pos);
+            self.records.push(&self.data[start..self.pos]);
+            self.pos += 1; // the terminating LF
+        }
+
+        fn tail_end(&mut self) {
+            // Only reached when content without a trailing LF is open.
+            let start = self.start.take().expect("tail_end implies open content");
+            self.records.push(&self.data[start..self.pos]);
+        }
     }
-    records
+
+    let collector = RecordScanner::new(CollectRecords {
+        data,
+        records: Vec::new(),
+        start: None,
+        pos: 0,
+    })
+    .scan(data);
+    collector.records
 }
 
 /// A fresh leaf hasher primed with the RFC 6962 section 2.1 leaf prefix 0x00.
@@ -788,35 +939,41 @@ pub fn root_and_path(leaves: &[&[u8]], m: usize) -> ([u8; 32], Vec<[u8; 32]>) {
 // --- Streaming root computation ---------------------------------------------
 //
 // `roottrace root` must not hold the batch in memory: the file is read through
-// a fixed-size buffer, every record is hashed as it streams past (a record is
-// never stored, however long it is), and the only per-record state kept is
-// the stack of completed subtree hashes below — at most one entry per bit of
-// the record count, so O(log n) hashes independent of the file's byte length
-// and of the longest record.
+// a fixed-size buffer and pushed through the shared [`RecordScanner`]. Every
+// record is hashed as its bytes stream past (a record is never stored, however
+// long it is), and the only per-record state the sink keeps is the stack of
+// completed subtree hashes below — at most one entry per bit of the record
+// count, so O(log n) hashes independent of the file's byte length and of the
+// longest record. Record division itself lives entirely in `RecordScanner`,
+// which is the exact code `prove`'s `split_records` drives.
 
 /// Incremental RFC 6962 Merkle Tree Hash over an LF-separated byte stream.
 ///
 /// Bytes are fed through [`RootStream::feed`] in chunks of any size; how many
 /// bytes one read returns is meaningless to the result, and a record that
-/// spans any number of chunks is hashed in full. Records are delimited by LF
-/// exactly as [`split_records`] defines (the separator is not content, a
-/// trailing LF only terminates the last record, an empty input is zero
-/// records), and the tree is folded with the same largest-power-of-two split
-/// as `build_tree`, so [`RootStream::finish`] returns exactly
-/// `mth(&split_records(whole))` for the concatenation `whole` of everything
-/// fed.
+/// spans any number of chunks is hashed in full. The LF/empty-record/trailing
+/// rule is applied by the shared [`RecordScanner`], exactly as
+/// [`split_records`] applies it to a whole batch, and the tree is folded with
+/// the same largest-power-of-two split as `build_tree`, so
+/// [`RootStream::finish`] returns exactly `mth(&split_records(whole))` for the
+/// concatenation `whole` of everything fed.
 ///
-/// Memory use is a small fixed amount plus at most 64 subtree hashes (one per
-/// bit of the record count): nothing grows with the number of bytes fed or
-/// with the length of any single record.
+/// Memory use is the read buffer plus a small fixed amount and at most 64
+/// subtree hashes (one per bit of the record count): nothing grows with the
+/// number of bytes fed or with the length of any single record.
 #[doc(hidden)]
 pub struct RootStream {
+    /// The shared divider, feeding this stream's hashing sink.
+    scanner: RecordScanner<StreamSink>,
+}
+
+/// [`RecordSink`] for the streaming root: hash content into the open leaf and
+/// fold one leaf per finished record into the subtree stack.
+struct StreamSink {
     /// Hasher for the record currently being accumulated, primed with 0x00.
+    /// It stays primed even before any content arrives, so an LF-terminated
+    /// empty record hashes to SHA-256(0x00).
     leaf: Sha256,
-    /// Whether any content byte of the current record has been seen. A record
-    /// only exists once it has content or is terminated by an LF, so an empty
-    /// input is zero records and a trailing LF adds none.
-    record_has_bytes: bool,
     /// Completed subtree hashes, bottom to top in strictly decreasing height;
     /// entry i covers 2^height consecutive leaves. Together the entries are
     /// the binary decomposition of the record count so far, which is exactly
@@ -824,29 +981,29 @@ pub struct RootStream {
     subtrees: Vec<([u8; 32], u32)>,
 }
 
-impl RootStream {
-    #[doc(hidden)]
-    pub fn new() -> Self {
-        RootStream {
-            leaf: new_leaf_hasher(),
-            record_has_bytes: false,
-            subtrees: Vec::new(),
-        }
+impl RecordSink for StreamSink {
+    fn record_bytes(&mut self, bytes: &[u8]) {
+        self.leaf.update(bytes);
     }
 
-    /// Feed the next chunk of input. LF bytes split records and are not
-    /// content; every other byte — space, tab, CR, NUL, non-UTF-8 — is hashed
-    /// into the current record as-is.
-    #[doc(hidden)]
-    pub fn feed(&mut self, mut chunk: &[u8]) {
-        while let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
-            self.leaf.update(&chunk[..pos]);
-            self.record_has_bytes |= pos > 0;
-            self.finish_record();
-            chunk = &chunk[pos + 1..];
+    fn record_end(&mut self) {
+        // Fires once per LF, so a leading or consecutive LF folds the empty
+        // record between them.
+        self.finish_record();
+    }
+
+    fn tail_end(&mut self) {
+        // Content after the last LF: the same fold as an LF termination.
+        self.finish_record();
+    }
+}
+
+impl StreamSink {
+    fn new() -> Self {
+        StreamSink {
+            leaf: new_leaf_hasher(),
+            subtrees: Vec::new(),
         }
-        self.leaf.update(chunk);
-        self.record_has_bytes |= !chunk.is_empty();
     }
 
     /// Close the current record: finalize its leaf hash and fold it into the
@@ -854,7 +1011,6 @@ impl RootStream {
     /// always holds the largest complete subtrees on the left.
     fn finish_record(&mut self) {
         let leaf = std::mem::replace(&mut self.leaf, new_leaf_hasher()).finalize();
-        self.record_has_bytes = false;
         let mut acc = leaf;
         let mut height = 0u32;
         while self.subtrees.last().is_some_and(|&(_, h)| h == height) {
@@ -865,14 +1021,9 @@ impl RootStream {
         self.subtrees.push((acc, height));
     }
 
-    /// Produce the batch root. A final record without a terminating LF counts
-    /// in full; a trailing LF adds no record; no input at all is the RFC 6962
-    /// empty-tree hash SHA-256("").
-    #[doc(hidden)]
-    pub fn finish(mut self) -> [u8; 32] {
-        if self.record_has_bytes {
-            self.finish_record();
-        }
+    /// Fold the completed subtrees into the batch root. No record means the
+    /// RFC 6962 empty-tree hash SHA-256("").
+    fn root(mut self) -> [u8; 32] {
         match self.subtrees.pop() {
             None => sha256(&[]),
             Some((mut acc, _)) => {
@@ -885,6 +1036,39 @@ impl RootStream {
                 acc
             }
         }
+    }
+}
+
+impl RootStream {
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        RootStream {
+            scanner: RecordScanner::new(StreamSink::new()),
+        }
+    }
+
+    /// Feed the next chunk of input. Division is the scanner's job: LF bytes
+    /// split records and are not content, while every other byte — space, tab,
+    /// CR, NUL, non-UTF-8 — is hashed into the current record as-is. A read
+    /// boundary never becomes a record boundary.
+    #[doc(hidden)]
+    pub fn feed(&mut self, chunk: &[u8]) {
+        self.scanner.feed(chunk);
+    }
+
+    /// Produce the batch root. A final record without a terminating LF counts
+    /// in full; a trailing LF adds no record; no input at all is the RFC 6962
+    /// empty-tree hash SHA-256("").
+    #[doc(hidden)]
+    pub fn finish(self) -> [u8; 32] {
+        self.scanner.finish().root()
+    }
+
+    /// Number of completed subtrees currently held, for the test that pins
+    /// state growth to O(log n) in the record count.
+    #[cfg(test)]
+    fn subtree_len(&self) -> usize {
+        self.scanner.sink.subtrees.len()
     }
 }
 
@@ -1330,10 +1514,10 @@ mod tests {
             s.feed(&chunk);
         }
         // One stack entry per set bit of the record count: 102_400 < 2^17.
+        let stack = s.subtree_len();
         assert!(
-            s.subtrees.len() <= 17,
-            "subtree stack must stay logarithmic, got {} entries",
-            s.subtrees.len()
+            stack <= 17,
+            "subtree stack must stay logarithmic, got {stack} entries"
         );
         let expected = mth(&vec![b"".as_slice(); 102_400]);
         assert_eq!(hex_of(&s.finish()), hex_of(&expected));
