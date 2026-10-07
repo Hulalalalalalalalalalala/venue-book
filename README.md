@@ -380,63 +380,205 @@ roottrace 0.1.0
 
 除命令行外，roottrace 同时是一个 Rust 库：其他 Rust 程序可以直接在内存中
 核验成员证明，无需准备完整批次或临时文件。在 `Cargo.toml` 中把本包加入
-`[dependencies]` 后，成员核验的入口是 `roottrace::verify_membership`：
+`[dependencies]` 后，成员核验的入口是 `roottrace::verify_membership`。
+
+下面用一个**含重复记录的小批次**给出可以整段复制的完整示例：记录、证明、
+可信值全部作为常量硬编码在程序里，复制后即可编译运行并得到真实的核验结果，
+不需要先准备任何输入文件。
+
+### 固定输入：一个 4 条记录的批次
+
+批次文件的全部字节是 `alpha\nbeta\nalpha\ngamma\n`（23 字节，末尾 LF 只
+结束最后一条记录）。按 LF 分隔出的完整记录序列为：
+
+| 序号 | 记录字节 | 说明 |
+| --- | --- | --- |
+| 0 | `alpha`（5 字节） | 与位置 2 的内容完全相同 |
+| 1 | `beta`（4 字节） | |
+| 2 | `alpha`（5 字节） | **目标位置**：要核验的记录在这里 |
+| 3 | `gamma`（5 字节） | |
+
+目标记录是序号 **2** 的 `alpha`。序号从 0 开始；位置 0 虽然与它字节完全
+相同，但是树中的另一个位置，对应另一份证明，本次核验不涉及它。
+
+对该文件运行命令行可以直接得到证明与根值，输出逐字节如下：
+
+```sh
+$ printf 'alpha\nbeta\nalpha\ngamma\n' > batch.txt
+$ roottrace root batch.txt
+e63979768f9a2e746fa65d9bc2b3c0c97346fa29188b7346912c9a462b0a4b56
+$ roottrace prove batch.txt 2
+{"tree_size":4,"leaf_index":2,"root":"e63979768f9a2e746fa65d9bc2b3c0c97346fa29188b7346912c9a462b0a4b56","audit_path":["4c79d0d62f7cf5ca8874155f2d3b875f2625da2bb3abc86bbd6833f25ba90e51","983cb57c04cddd52634edab38a7bef85708a974f114bbd9aa9ec5d4ce6656b4b"]}
+```
+
+- **证明**就是上面 `prove` 输出的那一整行 JSON（下面的程序以原始字节常量
+  给出，与命令行输出逐字节兼容）。两个审计路径哈希按从叶向根的顺序，依次
+  是同层兄弟叶子 `SHA-256(0x00 || "gamma")` 与左半边两棵叶子的父节点
+  `MTH(["alpha","beta"])`。
+- **可信树大小 4 与可信根值不是从证明里读出来的**，而是用证明之外的完整
+  批次数据独立确认的：这里是对同一个批次文件**单独运行 `roottrace root`**
+  得到的结果；在真实场景中可换成签名公告或带外账本。下面程序把这 64 个
+  十六进制字符写成完整的 32 字节数组，逐字节给满、没有省略。证明里的
+  `tree_size`/`root` 只用于和它们比对。
+
+> **字节边界。** 库函数收到的 `record: &[u8]` 是**一条记录的全部内容**：
+> 不按 LF 拆分，也不自动删除末尾的换行。从批次文件取出一条记录时，分隔它
+> 的那个 LF **不包含**在内——本例的记录就是 5 个字节 `alpha`，不是
+> `alpha\n`。因此额外给记录追加一个 LF，记录就变成 6 个字节的另一条记录。
+> 另外，空切片 `b""` 表示**一条空记录**（对应只含一个 LF 的批次里的那一条），
+> 它与“空树”是两回事：空树没有任何位置，可信树大小为 0 不能用来核验成员。
+
+### 完整程序与实际结果
 
 ```rust
-use roottrace::{verify_membership, VerifyError};
+use roottrace::{inspect_proof, verify_membership, VerifyError};
 
-// 1. 目标记录的全部原始字节（空切片表示一条空记录；末尾 LF/CR/空格、
-//    NUL、非 UTF-8 字节都属于内容，不按批次文件的 LF 规则切分）。
-let record: &[u8] = b"some record bytes";
-// 2. 证明 JSON 的原始字节（例如 `roottrace prove` 的输出；字段重排、
-//    合法空白与等价字符串转义都被接受）。
-let proof: &[u8] = br#"{"tree_size":9,"leaf_index":3,"root":"a8a3...dc3","audit_path":["..."]}"#;
-// 3. 独立确认的可信值：树大小（u64，必须为正）和 32 字节根值。
-let trusted_tree_size: u64 = 9;
-let trusted_root: [u8; 32] = [0xa8, 0xa3, /* ...来自可信渠道的 32 字节... */ 0xc3];
+fn hex(root: &[u8; 32]) -> String {
+    root.iter().map(|b| format!("{b:02x}")).collect()
+}
 
-match verify_membership(record, proof, trusted_tree_size, &trusted_root) {
-    Ok(membership) => {
-        // 核验成功：记录确实位于证明声明的位置。
-        println!("位置 {}", membership.leaf_index());   // 从 0 开始的记录序号
-        println!("树大小 {}", membership.tree_size());  // 即你的可信树大小
-        println!("根值 {:?}", membership.root());       // 即你的可信根值
+/// 核验一条记录并按“结果类型”报告：成功就读出序号、树大小和根值；失败只
+/// 区分错误变体。变体里附带的原因字符串仅供写日志，不要匹配它的固定文字。
+fn check(label: &str, record: &[u8], proof: &[u8], trusted_size: u64, trusted_root: &[u8; 32]) {
+    print!("{label}: ");
+    match verify_membership(record, proof, trusted_size, trusted_root) {
+        Ok(membership) => println!(
+            "核验成功：位置 {}，树大小 {}，根值 {}",
+            membership.leaf_index(),
+            membership.tree_size(),
+            hex(membership.root()),
+        ),
+        Err(VerifyError::MalformedProof(_)) => println!("MalformedProof（证明不符合完整格式）"),
+        Err(VerifyError::VerificationFailed(_)) => println!("VerificationFailed（格式合法但不匹配）"),
+        Err(VerifyError::InvalidTrustedSize) => println!("InvalidTrustedSize（可信树大小为零）"),
     }
-    Err(VerifyError::MalformedProof(reason)) => {
-        // 证明格式无效：不是合法的证明 JSON（字段缺失/重复、整数或哈希
-        // 不合法、对象后有多余字节等）。
-        eprintln!("证明格式无效: {reason}");
-    }
-    Err(VerifyError::VerificationFailed(reason)) => {
-        // 证明格式合法，但记录内容、可信树大小、可信根值或审计路径不匹配。
-        eprintln!("核验失败: {reason}");
-    }
-    Err(VerifyError::InvalidTrustedSize) => {
-        // 调用参数无效：可信树大小为 0。不存在包含记录的零节点树，
-        // 不会被当作"空树中的成员证明"接受。
-        eprintln!("可信树大小必须为正整数");
-    }
+}
+
+fn main() {
+    // 批次文件 alpha\nbeta\nalpha\ngamma\n 的完整记录序列（LF 分隔记录，
+    // 末尾 LF 只结束最后一条，不属于任何记录）：
+    //   位置 0 = "alpha"
+    //   位置 1 = "beta"
+    //   位置 2 = "alpha"   <- 目标记录；与位置 0 的字节完全相同
+    //   位置 3 = "gamma"
+    let record: &[u8] = b"alpha";
+
+    // `roottrace prove <批次文件> 2` 的原样输出：完整 JSON，没有任何省略。
+    let proof: &[u8] = br#"{"tree_size":4,"leaf_index":2,"root":"e63979768f9a2e746fa65d9bc2b3c0c97346fa29188b7346912c9a462b0a4b56","audit_path":["4c79d0d62f7cf5ca8874155f2d3b875f2625da2bb3abc86bbd6833f25ba90e51","983cb57c04cddd52634edab38a7bef85708a974f114bbd9aa9ec5d4ce6656b4b"]}"#;
+
+    // 可信值独立于证明获得：对上面的“完整批次”运行 `roottrace root`
+    // （生产中也可以来自签名公告或带外账本）。批次有 4 条记录，根值是
+    // 下面这 32 个字节，逐字节对应上面的证明，但不是从证明里照抄的。
+    let trusted_tree_size: u64 = 4;
+    let trusted_root: [u8; 32] = [
+        0xe6, 0x39, 0x79, 0x76, 0x8f, 0x9a, 0x2e, 0x74,
+        0x6f, 0xa6, 0x5d, 0x9b, 0xc2, 0xb3, 0xc0, 0xc9,
+        0x73, 0x46, 0xfa, 0x29, 0x18, 0x8b, 0x73, 0x46,
+        0x91, 0x2c, 0x9a, 0x46, 0x2b, 0x0a, 0x4b, 0x56,
+    ];
+
+    // 1) 原记录 + 原证明 + 独立可信值：核验成功。
+    check("原记录", record, proof, trusted_tree_size, &trusted_root);
+
+    // 2) 记录末尾追加一个 LF，证明和可信值都不变：这是另一条记录，必失败。
+    let mut with_lf = record.to_vec();
+    with_lf.push(b'\n');
+    check("加 LF", &with_lf, proof, trusted_tree_size, &trusted_root);
+
+    // 3) 证明被截断（数组和对象都没结束）：不符合完整格式。
+    check("截断证明", record, &proof[..proof.len() - 3], trusted_tree_size, &trusted_root);
+
+    // 4) 可信树大小传 0：调用参数无效；这与“空记录”无关。
+    check("大小为零", record, proof, 0, &trusted_root);
+
+    // 5) inspect_proof 只读出证明自己的声明，完全不核验成员身份。
+    let claims = inspect_proof(proof).expect("这份证明格式合法");
+    println!(
+        "inspect：证明自称 位置 {}、树大小 {}、根值 {}（未核验，不能当可信输入）",
+        claims.leaf_index(),
+        claims.tree_size(),
+        hex(claims.root()),
+    );
+
+    // 6) 空切片表示一条空记录。下面是“只含一个 LF 的批次”（一条空记录、
+    //    树大小 1、审计路径为空）的真实证明与独立根值。
+    let empty_proof: &[u8] = br#"{"tree_size":1,"leaf_index":0,"root":"6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d","audit_path":[]}"#;
+    let empty_root: [u8; 32] = [
+        0x6e, 0x34, 0x0b, 0x9c, 0xff, 0xb3, 0x7a, 0x98,
+        0x9c, 0xa5, 0x44, 0xe6, 0xbb, 0x78, 0x0a, 0x2c,
+        0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76,
+        0x85, 0x11, 0xa3, 0x06, 0x17, 0xaf, 0xa0, 0x1d,
+    ];
+    let m = verify_membership(b"", empty_proof, 1, &empty_root).expect("空记录应核验成功");
+    println!("空记录：位置 {}，树大小 {}", m.leaf_index(), m.tree_size());
 }
 ```
 
-**可信值必须独立确认。** 与 `verify` 命令一样，证明自带的 `tree_size` 和
-`root` 只用于和你提供的可信值比对，绝不作为信任依据；可信值应来自签名
-公告、带外账本，或对完整批次自行运行 `roottrace root` 等渠道。成功结果
-`Membership` 的 `tree_size()` 和 `root()` 返回的就是你传入并已核对一致
-的可信值，`leaf_index()` 是证明声明的（从 0 开始的）位置——相同内容出现
-在其他位置不能替代这个位置。树大小和序号始终保持完整 64 位含义，即使
-超过平台的指针宽度也不会被截断。
+实际运行结果如下，每一行对应程序中的一次调用：
 
-库本身不向标准输出或标准错误打印任何内容；成功与失败的展示方式完全由
-调用方决定。失败时只返回上述错误，不会返回任何表示已核验成功的结果。
-命令行的 `verify` 子命令与库函数走完全相同的核验代码，两边对同一输入的
-结论一致。
+```text
+原记录: 核验成功：位置 2，树大小 4，根值 e63979768f9a2e746fa65d9bc2b3c0c97346fa29188b7346912c9a462b0a4b56
+加 LF: VerificationFailed（格式合法但不匹配）
+截断证明: MalformedProof（证明不符合完整格式）
+大小为零: InvalidTrustedSize（可信树大小为零）
+inspect：证明自称 位置 2、树大小 4、根值 e63979768f9a2e746fa65d9bc2b3c0c97346fa29188b7346912c9a462b0a4b56（未核验，不能当可信输入）
+空记录：位置 0，树大小 1
+```
 
-**只想读取证明的声明而不核验？** 库为此提供
+成功时从类型化结果 `Membership` 读取三个值：
+
+- `leaf_index()` 返回 `2`——证明声明的、从 0 开始的记录序号。它只锚定
+  位置 2；位置 0 那条同内容的 `alpha` **并不因此**被视为已核验（对它要
+  另行用 `prove batch.txt 0` 生成的、`leaf_index` 为 0 的另一份证明）。
+- `tree_size()` 返回 `4`——就是你传入的可信树大小（已与证明自带字段核对
+  一致），不是从证明里另读出来的值。
+- `root()` 返回那 32 个字节（`&[u8; 32]`）——就是你的可信根值，写成十六
+  进制为 `e63979768f9a2e746fa65d9bc2b3c0c97346fa29188b7346912c9a462b0a4b56`，
+  与 `roottrace root` 对该批次的输出逐字节相同。
+
+“加 LF”一行演示字节边界的后果：只给目标记录末尾多追加一个 LF（记录变成
+`alpha\n`），证明与可信值原封不动，结论就只能是核验失败，不会再出现成功
+结果。
+
+### 三类错误按类型区分，不要匹配原因字符串
+
+处理 `Err(VerifyError)` 时要按**变体（类型）**分支决定怎么办；变体附带的
+原因字符串只用于写日志，其文字可能调整，不要依赖它的固定措辞：
+
+- `VerifyError::MalformedProof(reason)`：证明不符合**完整格式**——不是一个
+  完整 JSON 对象、必需字段缺失或重复、值的类型错误、整数或哈希不合法、
+  证明内 `tree_size` 为 0、序号越界、对象后有多余字节等。上例把证明末尾
+  截掉 3 个字节即属此类。
+- `VerifyError::VerificationFailed(reason)`：证明**格式合法**，但记录内容、
+  可信树大小、可信根值或审计路径对不上。记录多一个 LF、可信值换成别的
+  批次、证明自带大小/根值与可信值不一致、路径缺一个/多一个/顺序错，都归
+  这一类。
+- `VerifyError::InvalidTrustedSize`：调用参数无效——可信树大小为 0。该判断
+  在解读证明**之前**完成，所以即便拿到的是一份内部 `tree_size` 为 0 的
+  “证明”，报的也是这个类型而非格式错误。不存在包含记录的零节点树，它不是
+  “空树中的成员证明”。
+
+### `inspect_proof` 只读声明，其结果不能当可信输入
+
+只想读证明自身的声明而不核验时，用
 `roottrace::inspect_proof(&[u8]) -> Result<ProofClaims, InspectError>`：它用
-与 `verify_membership` 完全相同的完整格式判定解读证明，成功则返回证明自身
-声明的 `tree_size()`、`leaf_index()` 与 `root()`。这里没有目标记录和可信
-值，因此**不做成员核验**——审计路径能否证明声明位置完全不检查；返回的大小
-和根值直接来自证明，绝不能当作 `verify_membership` 的可信输入。证明格式
-无效时返回 `InspectError::MalformedProof`。命令行的 `inspect` 子命令就建立
-在这个函数之上。
+与 `verify_membership` 完全相同的完整格式判定解读证明，成功则返回证明自称
+的 `tree_size()`、`leaf_index()` 与 `root()`。但这一步**没有目标记录、没有
+独立可信值，因此不做成员核验**——审计路径的哈希能否把记录结合到声明位置
+完全不检查；只要格式合法，哪怕路径是随便填的，这些字段也会被原样读出。
+
+所以一次成功的 `inspect_proof` 只表示“读出了证明自己的声明”。上例第 5 步
+打印出的大小 4 与根值恰好和真值相同，仅仅因为这份证明确实是我们自己对真实
+批次生成的；**绝不能**把 `claims.tree_size()`/`claims.root()` 直接回传给
+`verify_membership` 去核验同一份证明——证明可能来自不可信一方，那样做等于
+让证明自我背书。可信值仍须来自 `roottrace root`、签名公告或带外账本等
+独立渠道。证明格式无效时返回 `InspectError::MalformedProof`；命令行的
+`inspect` 子命令就建立在这个函数之上。
+
+### 其他约定
+
+库本身不向标准输出或标准错误打印任何内容；成功与失败如何展示完全由调用方
+决定，失败时只返回上述错误，不会返回任何表示已核验成功的结果。命令行的
+`verify` 子命令与库函数走完全相同的核验代码，两边对同一输入的结论一致。
+树大小和序号始终保持完整的 64 位无符号整数含义，即使超过平台的指针宽度也
+不会被截断。
