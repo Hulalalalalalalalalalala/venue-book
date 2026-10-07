@@ -6,8 +6,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use roottrace::{
-    claims_json, hex, hex_nibble, inspect_proof, is_lower_hex, proof_json, root_and_path,
-    split_records, RootStream,
+    claims_json, hex, hex_nibble, inspect_proof, is_lower_hex, split_records, RootStream,
 };
 
 const VERSION: &str = "0.1.0";
@@ -332,13 +331,16 @@ fn proof_for_file(path: &Path, index: u64) -> Result<String, ProveError> {
     let data = fs::read(path)
         .map_err(|e| ProveError::Read(format!("cannot read '{}': {e}", display_path(path))))?;
     let records = split_records(&data);
-    let size = records.len() as u64;
-    if index >= size {
-        return Err(ProveError::Missing(index, size));
+    // The generation itself is the library entry point
+    // `roottrace::prove_membership`, so the command and Rust callers of the
+    // library share exactly one proof-generation path.
+    match roottrace::prove_membership(&records, index) {
+        Ok(proof) => Ok(proof.to_json()),
+        Err(roottrace::ProveError::IndexOutOfRange {
+            requested_index,
+            tree_size,
+        }) => Err(ProveError::Missing(requested_index, tree_size)),
     }
-    let idx = index as usize;
-    let (root, audit_path) = root_and_path(&records, idx);
-    Ok(proof_json(size, index, &root, &audit_path))
 }
 
 /// Read a proof file and return the one-line JSON object `inspect` prints:

@@ -1,11 +1,23 @@
-//! roottrace 库入口：为其他 Rust 程序提供 RFC 6962 成员证明（包含证明）核验。
+//! roottrace 库入口：为其他 Rust 程序提供 RFC 6962 成员证明（包含证明）的
+//! 生成与核验。
 //!
 //! 命令行程序 `roottrace` 的 `root`/`prove`/`verify` 子命令同样建立在本文件的
-//! 实现之上，因此库与命令行对同一批数据的核验结果完全一致。
+//! 实现之上，因此库与命令行对同一批数据的生成与核验结果完全一致。
 //!
 //! # 用法概览
 //!
-//! 调用方需要准备三样东西，全部在内存中，无需完整批次或临时文件：
+//! **生成证明**（[`prove_membership`]）：调用方提交内存中的有序记录批次
+//! （`&[&[u8]]`，每个元素就是一条完整记录，内容里的 LF 不再拆分）和一个从 0
+//! 开始的记录序号，即可得到该位置在整个批次中的证明 [`MembershipProof`]——
+//! 包括树大小、记录序号、32 字节根值、从叶子到根排列的兄弟哈希，以及不带
+//! 行末换行的单行 JSON。记录内容本身带 LF 的批次无法用批次文件表达，正是
+//! 这个入口的用途；能用批次文件表达时，生成的 JSON 与 `roottrace prove`
+//! 输出的 JSON 对象逐字节一致。序号越界（含空批次）按类型返回
+//! [`ProveError::IndexOutOfRange`]。生成只按规则构造证明，不代表根值已经
+//! 获得外部信任。
+//!
+//! **核验证明**（[`verify_membership`]）：调用方需要准备三样东西，全部在
+//! 内存中，无需完整批次或临时文件：
 //!
 //! 1. **记录**：目标记录的全部原始字节（`&[u8]`）。每个字节都属于内容——
 //!    空切片表示一条空记录；末尾的 LF、CR、空格、NUL 与非 UTF-8 字节都参与
@@ -228,6 +240,145 @@ pub fn inspect_proof(proof: &[u8]) -> Result<ProofClaims, InspectError> {
         tree_size: proof.tree_size,
         leaf_index: proof.leaf_index,
         root: proof.root,
+    })
+}
+
+/// 生成成功的类型化结果：批次中指定位置的 RFC 6962 成员证明（包含证明）。
+///
+/// 树大小、记录序号、32 字节根值与从叶子到根排列的兄弟哈希都可直接读取；
+/// [`MembershipProof::to_json`] 给出与 `roottrace prove` 相同格式的单行
+/// JSON。生成只表示证明按规则构造完成，**不代表**根值已获得任何外部信任
+/// ——接收方核验时仍需通过独立渠道确认树大小与根值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipProof {
+    tree_size: u64,
+    leaf_index: u64,
+    root: [u8; 32],
+    audit_path: Vec<[u8; 32]>,
+}
+
+impl MembershipProof {
+    /// 完整批次的记录数（树大小），保持完整 64 位无符号整数含义。
+    pub fn tree_size(&self) -> u64 {
+        self.tree_size
+    }
+
+    /// 被证明记录的序号（从 0 开始），即调用时指定的位置。相同内容出现在
+    /// 其他位置不影响本证明锚定的位置。
+    pub fn leaf_index(&self) -> u64 {
+        self.leaf_index
+    }
+
+    /// 整批记录的 32 字节根值，与 `roottrace root` 对同一记录序列的输出
+    /// 相同。该值由本批次算出，尚未获得任何外部信任。
+    pub fn root(&self) -> &[u8; 32] {
+        &self.root
+    }
+
+    /// 审计路径：兄弟子树哈希按**从叶子向根**的顺序排列（RFC 6962 第
+    /// 2.1.1 节）。批次只有一条记录时为空切片。
+    pub fn audit_path(&self) -> &[[u8; 32]] {
+        &self.audit_path
+    }
+
+    /// 单行 JSON 证明（**不带**行末换行），格式与 `roottrace prove` 输出
+    /// 的 JSON 对象相同：`tree_size`、`leaf_index` 为整数，`root` 与
+    /// `audit_path` 元素为 64 位小写十六进制。证明中不包含原始记录。同一
+    /// 记录序列能用批次文件表示时，本方法与 `prove` 输出的 JSON 对象逐
+    /// 字节一致，可直接交给 `roottrace inspect`/`roottrace verify` 或
+    /// [`inspect_proof`]/[`verify_membership`]。
+    pub fn to_json(&self) -> String {
+        proof_json(self.tree_size, self.leaf_index, &self.root, &self.audit_path)
+    }
+}
+
+/// 生成证明失败的分类，调用方可按变体区分处理方式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProveError {
+    /// 请求的位置不存在：序号等于或超过批次的实际记录数。空批次（零条
+    /// 记录）没有任何可选位置，对任何序号都返回本错误——不存在空树的
+    /// 成员证明。变体携带请求序号（完整 u64 含义，不截断）与实际记录数。
+    IndexOutOfRange {
+        /// 调用方请求的、从 0 开始的记录序号。
+        requested_index: u64,
+        /// 批次实际的记录数；空批次为 0。
+        tree_size: u64,
+    },
+}
+
+impl fmt::Display for ProveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProveError::IndexOutOfRange { requested_index, tree_size } => write!(
+                f,
+                "record index {requested_index} does not exist: the batch holds {tree_size} record(s)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProveError {}
+
+/// 为内存中的有序记录批次直接生成指定位置的成员证明，无需批次文件、
+/// 临时文件或命令行。
+///
+/// - `records`：完整批次，**每个元素就是一条完整记录**的全部字节。元素
+///   不再按内容里的换行拆分：开头、内部或末尾的 LF，以及 CR、空格、NUL
+///   与非 UTF-8 字节都属于记录内容，不修剪、不替换。空切片 `b""` 仍占
+///   一个位置（一条空记录），与没有任何记录的空批次不同。重复内容按
+///   实际位置保留，记录顺序参与根值计算。
+/// - `leaf_index`：从 0 开始的记录序号，保留完整 u64 含义；较大数值
+///   不会被截断后误选一个合法位置。相同内容出现多次时，生成的是该序号
+///   位置的证明，不会改为前一次出现的位置。
+///
+/// 树形沿用 RFC 6962：只有一条记录时审计路径为空；记录数为奇数（非
+/// 二次幂）时按 RFC 的不均匀子树构造，不复制末条记录也不补空记录。
+///
+/// 序号等于或超过记录数时返回 [`ProveError::IndexOutOfRange`]（携带请求
+/// 序号与实际记录数）；空批次对任何序号都返回同一错误，不会异常终止，
+/// 也不会给出空树成员证明。库本身不向标准输出或标准错误打印任何内容。
+///
+/// # 示例
+///
+/// ```
+/// use roottrace::{prove_membership, verify_membership, ProveError};
+///
+/// // 一条记录本身含有 LF：批次文件无法表达这种批次，内存批次可以。
+/// let records: &[&[u8]] = &[b"alpha", b"line one\nline two", b"omega"];
+/// let proof = prove_membership(records, 1).expect("位置 1 存在");
+/// assert_eq!(proof.tree_size(), 3);
+/// assert_eq!(proof.leaf_index(), 1);
+///
+/// // 单行 JSON 证明（无行末换行），可直接交给查看与核验功能。
+/// let json = proof.to_json();
+/// assert!(!json.ends_with('\n'));
+/// // 可信值必须独立确认；这里仅演示流程，复用刚生成的根值。
+/// let m = verify_membership(records[1], json.as_bytes(), 3, proof.root()).unwrap();
+/// assert_eq!(m.leaf_index(), 1);
+///
+/// // 序号越界（含空批次）按类型报错，携带请求序号与实际记录数。
+/// assert_eq!(
+///     prove_membership(records, 3),
+///     Err(ProveError::IndexOutOfRange { requested_index: 3, tree_size: 3 })
+/// );
+/// ```
+pub fn prove_membership(records: &[&[u8]], leaf_index: u64) -> Result<MembershipProof, ProveError> {
+    // 记录数来自切片长度，在任何支持的平台上都精确装入 u64；序号先与它
+    // 比较，越界（含空批次）直接按类型报错，较大的 u64 序号不会截断。
+    let tree_size = records.len() as u64;
+    if leaf_index >= tree_size {
+        return Err(ProveError::IndexOutOfRange {
+            requested_index: leaf_index,
+            tree_size,
+        });
+    }
+    // leaf_index < tree_size <= usize::MAX，此处转换不损失数值。
+    let (root, audit_path) = root_and_path(records, leaf_index as usize);
+    Ok(MembershipProof {
+        tree_size,
+        leaf_index,
+        root,
+        audit_path,
     })
 }
 

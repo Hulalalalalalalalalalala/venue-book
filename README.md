@@ -150,6 +150,20 @@ LF 时输出逐字节相同；长记录后半段仅改动一个非 LF 字节后�
 空白与等价转义被接受而重复字段仍被拒绝；重复内容只按声明位置核验；2^63、
 2^63+1、2^64-1 的树大小与超过 32 位的序号保持完整 64 位含义。
 
+`tests/library_prove.rs` 对库的**证明生成**入口 `roottrace::prove_membership`
+做端到端检验：调用方提交内存中的有序记录批次和从 0 开始的序号，不写批次文件、
+不调用命令行。覆盖：能用批次文件表示的记录序列在两种文件形式（末尾有/无 LF）
+下，每个位置生成的 JSON 与真实 `prove` 输出逐字节一致、根值与 `root` 命令相同，
+生成的单行 JSON（无行末换行）可直接交给 `inspect_proof` 与 `verify_membership`
+核验；记录本身含 LF（开头/内部/末尾）、CR、空格、NUL 与非 UTF-8 字节时原样
+作为一条记录，单记录树与 9 条非二次幂树的根值和审计路径与
+`tests/reference/rfc6962_lf_record_vectors.py` 独立固定的常量逐哈希一致，并用
+独立确认的可信值核验成功；空字节记录占一个位置（根值 SHA-256(0x00)），空批次
+与空记录严格区分；重复内容按位置各自生成证明；奇数条记录沿用 RFC 6962 不均匀
+树形（5 条与 9 条的末条路径都只有一个兄弟哈希）；序号等于或超过记录数（含
+空批次的任何序号、以及 u64 范围内的巨大序号）返回按类型识别的
+`ProveError::IndexOutOfRange`，携带未截断的请求序号与实际记录数，不异常终止。
+
 `tests/verify_big_tree_regression.rs` 对**大树**（树大小接近 64 位无符号整数上限）
 的核验做端到端保障：树大小为 9223372036854775808（2^63，二次幂树）、
 9223372036854775809（2^63+1，不均匀树）与 18446744073709551615（2^64-1，不均匀
@@ -424,8 +438,75 @@ roottrace 0.1.0
 ## 作为 Rust 库调用
 
 除命令行外，roottrace 同时是一个 Rust 库：其他 Rust 程序可以直接在内存中
-核验成员证明，无需准备完整批次或临时文件。在 `Cargo.toml` 中把本包加入
-`[dependencies]` 后，成员核验的入口是 `roottrace::verify_membership`。
+**生成**与**核验**成员证明，无需准备完整批次文件或临时文件。在 `Cargo.toml`
+中把本包加入 `[dependencies]` 后，证明生成的入口是
+`roottrace::prove_membership`，成员核验的入口是 `roottrace::verify_membership`。
+
+### 在内存中直接生成证明：`prove_membership`
+
+```rust
+pub fn prove_membership(records: &[&[u8]], leaf_index: u64)
+    -> Result<MembershipProof, ProveError>
+```
+
+调用方提交内存中的有序记录批次和一个从 0 开始的记录序号，即可得到该位置在
+整个批次中的 RFC 6962 成员证明。现有公开用法通过 `prove` 读取按 LF 分隔的
+批次文件，无法表达记录内容本身带 LF 的批次；本入口让每个元素直接就是一条
+完整记录，这种批次也能直接生成证明。
+
+**记录边界（与批次文件的 LF 规则不同，重要）：**
+
+- `records` 的**每个元素就是一条完整记录**，不再按内容里的换行拆分。开头、
+  内部或末尾的 LF，以及 CR、空格、NUL 和非 UTF-8 字节都属于记录内容，
+  不修剪、不替换。
+- 空切片 `b""` 仍占一个位置（一条空记录），与没有任何记录的空批次是两回事。
+- 重复内容按实际位置保留，顺序参与根值计算；指定后一次出现的位置时，生成的
+  是该位置的证明，不会改为前一次出现的位置。
+
+**成功结果 `MembershipProof` 可读取：**
+
+- `tree_size()`：完整批次的记录数（完整 64 位含义）。
+- `leaf_index()`：被证明记录的序号（从 0 开始），即调用时指定的位置。
+- `root()`：整批记录的 32 字节根值（`&[u8; 32]`）。
+- `audit_path()`：兄弟哈希按**从叶子向根**排列（`&[[u8; 32]]`）；批次只有
+  一条记录时为空切片，奇数条记录沿用 RFC 6962 的不均匀树形，不复制末条
+  记录也不补空记录。
+- `to_json()`：不带行末换行的单行 JSON 证明，格式与 `prove` 相同（不含原始
+  记录）。同一记录序列能用批次文件表示时，它与 `prove` 输出的 JSON 对象
+  逐字节一致，可直接交给 `roottrace inspect`/`roottrace verify` 或库函数
+  `inspect_proof`/`verify_membership`。
+
+**错误结果：** 序号等于或超过记录数时返回可按类型识别的
+`ProveError::IndexOutOfRange { requested_index, tree_size }`，携带请求序号
+（完整 u64 含义，较大值不会截断后误选合法位置）与实际记录数；空批次对任何
+序号都返回同一错误，不会异常终止，也不会给出空树成员证明。
+
+**注意：** 库本身不向标准输出或标准错误打印任何内容；生成结果只表示证明按
+规则构造完成，**不代表**根值已经获得外部信任——接收方核验时仍须通过独立
+渠道确认树大小与根值。
+
+```rust
+use roottrace::{prove_membership, verify_membership, ProveError};
+
+// 三条记录，其中一条本身含有 LF——这种批次无法用批次文件表达。
+let records: &[&[u8]] = &[b"alpha", b"line one\nline two", b"omega"];
+match prove_membership(records, 1) {
+    Ok(proof) => {
+        assert_eq!(proof.tree_size(), 3);
+        assert_eq!(proof.leaf_index(), 1);
+        let json = proof.to_json(); // 单行 JSON，无行末换行
+        // 可信值须独立确认；这里演示时取生成出的根值仅作流程示意。
+        let m = verify_membership(records[1], json.as_bytes(), 3, proof.root())
+            .expect("刚生成的证明应核验成功");
+        assert_eq!(m.leaf_index(), 1);
+    }
+    Err(ProveError::IndexOutOfRange { requested_index, tree_size }) => {
+        panic!("位置 {requested_index} 不存在：批次共 {tree_size} 条记录");
+    }
+}
+```
+
+### 核验示例：一个含重复记录的小批次
 
 下面用一个**含重复记录的小批次**给出可以整段复制的完整示例：记录、证明、
 可信值全部作为常量硬编码在程序里，复制后即可编译运行并得到真实的核验结果，
@@ -624,6 +705,7 @@ inspect：证明自称 位置 2、树大小 4、根值 e63979768f9a2e746fa65d9bc
 
 库本身不向标准输出或标准错误打印任何内容；成功与失败如何展示完全由调用方
 决定，失败时只返回上述错误，不会返回任何表示已核验成功的结果。命令行的
-`verify` 子命令与库函数走完全相同的核验代码，两边对同一输入的结论一致。
+`prove` 与 `verify` 子命令分别与库函数 `prove_membership`、`verify_membership`
+走完全相同的生成与核验代码，两边对同一输入的结论一致。
 树大小和序号始终保持完整的 64 位无符号整数含义，即使超过平台的指针宽度也
 不会被截断。
